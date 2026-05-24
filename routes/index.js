@@ -31,8 +31,10 @@ router.get('/daily-operations/last', async (req, res) => {
 // Recent entries table
 router.get('/daily-operations', async (req, res) => {
   try {
-    const { branch_id } = parseInt(req.query) || 1;
-     const { limit = 10 } = parseInt(req.query) || 10;
+    // ✅ CORRECT — extract property first, then parse
+    const branch_id = parseInt(req.query.branch_id) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+
     const [rows] = await db.promise().execute(
       `SELECT date, sold_kg, revenue, (sold_kg * cost_per_kg) as total_cost, 
               profit, closing_stock_kg 
@@ -40,10 +42,11 @@ router.get('/daily-operations', async (req, res) => {
        WHERE branch_id = ? 
        ORDER BY date DESC 
        LIMIT ?`,
-      [branch_id , limit]
+      [branch_id, limit]
     );
     res.json(rows);
   } catch (error) {
+    console.error('Daily operations error:', error.message);
     res.status(500).json({ message: error.message });
   }
 });
