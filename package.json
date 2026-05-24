@@ -4,8 +4,8 @@
   "description": "",
   "main": "server.js",
   "scripts": {
-    "test": "nodemon server.js",
-    "start": "nodemon server.js",
+    "test": "node server.js",
+    "start": "node server.js",
     "dev": "nodemon server.js"
   },
   "author": "elmasha",
