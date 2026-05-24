@@ -29,8 +29,10 @@ app.use('/api', require('./routes/businessRoutes'));
 
 
 
-const PORT = process.env.PORT || 5000;
 
+const PORT = process.env.PORT || 5000;
+// Base route
+app.get("/", (req, res) => res.send("🚀 MeatPro Backend API Running "));
 // 🔹 Start Server
 app.listen(PORT, () => {
     console.log(`🚀 MeatPro Server running on port ${PORT}`);
