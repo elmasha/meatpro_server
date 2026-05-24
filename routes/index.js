@@ -31,30 +31,11 @@ router.get('/daily-operations/last', async (req, res) => {
 // Recent entries table
 router.get('/daily-operations', async (req, res) => {
   try {
-    console.log('=== DAILY OPS DEBUG ===');
-    console.log('req.query:', req.query);
-    console.log('req.query type:', typeof req.query);
-    
-    // Extract with explicit fallbacks
-    const branch_id = req.query.branch_id 
-      ? parseInt(req.query.branch_id) 
-      : 1;
-    
-    const limit = req.query.limit 
-      ? parseInt(req.query.limit) 
-      : 10;
+    const branch_id = parseInt(req.query.branch_id) || 1;
+    const limit = parseInt(req.query.limit) || 10;
 
-    console.log('Parsed values:', { branch_id, limit, types: [typeof branch_id, typeof limit] });
-
-    // Validate they're actual numbers
-    if (isNaN(branch_id) || isNaN(limit)) {
-      return res.status(400).json({ 
-        message: 'Invalid parameters',
-        received: req.query 
-      });
-    }
-
-    const [rows] = await db.promise().execute(
+    // ✅ Use .query() with pool — more reliable than .execute()
+    const [rows] = await db.promise().query(
       `SELECT date, sold_kg, revenue, (sold_kg * cost_per_kg) as total_cost, 
               profit, closing_stock_kg 
        FROM daily_entries 
@@ -63,13 +44,9 @@ router.get('/daily-operations', async (req, res) => {
        LIMIT ?`,
       [branch_id, limit]
     );
-    
-    console.log('Query success, rows:', rows.length);
     res.json(rows);
-    
   } catch (error) {
-    console.error('Daily operations error:', error.message);
-    console.error('Full error:', error);
+    console.error('Daily ops error:', error);
     res.status(500).json({ message: error.message });
   }
 });
@@ -79,14 +56,24 @@ router.get('/daily-operations', async (req, res) => {
 router.patch('/daily-operations/:branch_id/:date', async (req, res) => {
   try {
     const { payment_cash, payment_mpesa } = req.body;
-    await db.promise().execute(
+    
+    // Parse to ensure proper types
+    const cash = parseFloat(payment_cash) || 0;
+    const mpesa = parseFloat(payment_mpesa) || 0;
+    const branch_id = parseInt(req.params.branch_id);
+    const date = req.params.date;
+
+    // ✅ Use .query() instead of .execute() for pool
+    await db.promise().query(
       `UPDATE daily_entries 
        SET payment_cash = ?, payment_mpesa = ? 
        WHERE branch_id = ? AND date = ?`,
-      [payment_cash || 0, payment_mpesa || 0, req.params.branch_id, req.params.date]
+      [cash, mpesa, branch_id, date]
     );
+    
     res.json({ message: 'Payments updated' });
   } catch (error) {
+    console.error('Patch error:', error);
     res.status(500).json({ message: error.message });
   }
 });
