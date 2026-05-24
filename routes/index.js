@@ -13,7 +13,7 @@ const stock = require('../controllers/stockController');
 // Returns the most recent entry for auto-filling opening stock
 router.get('/daily-operations/last', async (req, res) => {
   try {
-    const { branch_id } = req.query;
+    const { branch_id } = parseInt(req.query);
     const [rows] = await db.promise().execute(
       `SELECT * FROM daily_entries 
        WHERE branch_id = ? 
@@ -31,7 +31,7 @@ router.get('/daily-operations/last', async (req, res) => {
 // Recent entries table
 router.get('/daily-operations', async (req, res) => {
   try {
-    const { branch_id, limit = 10 } = req.query;
+    const { branch_id, limit = 10 } = parseInt(req.query);
     const [rows] = await db.promise().execute(
       `SELECT date, sold_kg, revenue, (sold_kg * cost_per_kg) as total_cost, 
               profit, closing_stock_kg 
