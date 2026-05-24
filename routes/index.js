@@ -31,9 +31,28 @@ router.get('/daily-operations/last', async (req, res) => {
 // Recent entries table
 router.get('/daily-operations', async (req, res) => {
   try {
-    // ✅ CORRECT — extract property first, then parse
-    const branch_id = parseInt(req.query.branch_id) || 1;
-    const limit = parseInt(req.query.limit) || 10;
+    console.log('=== DAILY OPS DEBUG ===');
+    console.log('req.query:', req.query);
+    console.log('req.query type:', typeof req.query);
+    
+    // Extract with explicit fallbacks
+    const branch_id = req.query.branch_id 
+      ? parseInt(req.query.branch_id) 
+      : 1;
+    
+    const limit = req.query.limit 
+      ? parseInt(req.query.limit) 
+      : 10;
+
+    console.log('Parsed values:', { branch_id, limit, types: [typeof branch_id, typeof limit] });
+
+    // Validate they're actual numbers
+    if (isNaN(branch_id) || isNaN(limit)) {
+      return res.status(400).json({ 
+        message: 'Invalid parameters',
+        received: req.query 
+      });
+    }
 
     const [rows] = await db.promise().execute(
       `SELECT date, sold_kg, revenue, (sold_kg * cost_per_kg) as total_cost, 
@@ -44,9 +63,13 @@ router.get('/daily-operations', async (req, res) => {
        LIMIT ?`,
       [branch_id, limit]
     );
+    
+    console.log('Query success, rows:', rows.length);
     res.json(rows);
+    
   } catch (error) {
     console.error('Daily operations error:', error.message);
+    console.error('Full error:', error);
     res.status(500).json({ message: error.message });
   }
 });
