@@ -24,6 +24,7 @@ app.use('/api', require('./routes/index'));
 app.use('/api', require('./routes/reportRoutes'));
 app.use('/api', require('./routes/expenseRoutes'));
 app.use('/api', require('./routes/stockRoutes'));
+app.use('/api', require('./routes/subscriptionRoutes'));
 // In your main server file
 app.use('/api', require('./routes/businessRoutes'));
 
