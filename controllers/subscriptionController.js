@@ -35,6 +35,7 @@ exports.getPlans = async (req, res) => {
 };
 
 // GET /api/subscriptions/status?firebase_uid=xxx
+// FIXED: Uses COALESCE to handle both plan (varchar) and plan_id
 exports.getStatus = async (req, res) => {
   try {
     const firebaseUid = req.query.firebase_uid;
@@ -43,26 +44,43 @@ exports.getStatus = async (req, res) => {
     const userId = await getUserId(firebaseUid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
+    // FIXED: Join on plan name since plan_id may be NULL for old records
     const [rows] = await db.promise().query(`
-      SELECT s.*, p.name as plan_name, p.display_name, p.price_kes, p.features
+      SELECT s.*, 
+        COALESCE(p.name, s.plan, 'starter') as plan_name,
+        COALESCE(p.display_name, 'Starter (Free)') as display_name,
+        COALESCE(p.price_kes, 0) as price_kes,
+        COALESCE(p.features, '["1 branch","Daily operations","Basic profit summary","7-day history"]') as features
       FROM subscriptions s
-      LEFT JOIN plans p ON s.plan_id = p.id
+      LEFT JOIN plans p ON COALESCE(s.plan_id, 0) = p.id OR s.plan = p.name
       WHERE s.user_id = ?
       ORDER BY s.created_at DESC
       LIMIT 1
     `, [userId]);
 
-    // Fallback to user's subscription string if no subscription record
-    const subscription = rows[0] || {
-      status: 'expired',
-      plan_name: 'starter',
-      display_name: 'Starter (Free)',
-      plan_id: 1,
-      end_date: null,
-      features: '["1 branch","Daily operations","Basic profit summary","7-day history"]'
-    };
+    // If no subscription record, check users table subscription field
+    let subscription = rows[0];
+    
+    if (!subscription) {
+      const [userRows] = await db.promise().query(
+        'SELECT subscription, subscription_status, subscription_expires FROM users WHERE id = ?',
+        [userId]
+      );
+      const userSub = userRows[0];
+      
+      subscription = {
+        status: userSub?.subscription_status || 'expired',
+        plan: userSub?.subscription || 'starter',
+        plan_name: userSub?.subscription || 'starter',
+        display_name: userSub?.subscription === 'pro' ? 'Professional' : 'Starter (Free)',
+        end_date: userSub?.subscription_expires,
+        features: userSub?.subscription === 'pro' 
+          ? '["Unlimited branches","Advanced analytics","Waste alerts","Full history + CSV export","Multi-user access"]'
+          : '["1 branch","Daily operations","Basic profit summary","7-day history"]'
+      };
+    }
 
-    const isActive = subscription.status === 'active' && 
+    const isActive = (subscription.status === 'active' || subscription.status === 'free') && 
       subscription.end_date && new Date(subscription.end_date) > new Date();
 
     const daysRemaining = isActive 
@@ -124,22 +142,22 @@ exports.initiatePayment = async (req, res) => {
     const plan = plans[0];
     const reference = `MPESA_${Date.now()}_${userId}`;
 
-    // Create pending subscription (matches your schema: user_id, plan, amount, start_date, end_date, status)
+    // Insert subscription using BOTH plan_id and plan name for compatibility
     const [subResult] = await db.promise().query(
-      `INSERT INTO subscriptions (user_id,  plan, amount, start_date, end_date, status, payment_reference, created_at)
-       VALUES (?, ?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 'pending', ?, NOW())`,
-      [userId, plan.name, plan.price_kes, reference]
+      `INSERT INTO subscriptions (user_id, plan_id, plan, amount, start_date, end_date, status, payment_reference, created_at)
+       VALUES (?, ?, ?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 'pending', ?, NOW())`,
+      [userId, plan.id, plan.name, plan.price_kes, reference]
     );
 
-    // Log payment (matches your schema: user_id, amount, phone, subscription, checkout_request_id)
+    // Insert payment
     await db.promise().query(
-      `INSERT INTO payments (user_id,  amount, phone, subscription, checkout_request_id, status, transaction_desc, created_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', ?, NOW())`,
-      [userId, plan.price_kes, phone, plan.name, reference, `Subscription: ${plan.display_name}`]
+      `INSERT INTO payments (user_id, subscription_id, amount, phone, subscription, checkout_request_id, status, transaction_desc, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NOW())`,
+      [userId, subResult.insertId, plan.price_kes, phone, plan.name, reference, `Subscription: ${plan.display_name}`]
     );
 
     // === REAL M-PESA STK PUSH (Uncomment for production) ===
-    
+    /*
     const token = await getMpesaToken();
     const timestamp = new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
     const shortcode = process.env.MPESA_SHORTCODE;
@@ -159,7 +177,7 @@ exports.initiatePayment = async (req, res) => {
       AccountReference: `MeatPro_${userId}`,
       TransactionDesc: `MeatPro ${plan.display_name}`
     }, { headers: { Authorization: `Bearer ${token}` }});
-    
+    */
 
     res.json({
       message: 'Payment initiated. Check your phone for M-Pesa prompt.',
@@ -205,7 +223,7 @@ exports.mpesaCallback = async (req, res) => {
         [receipt, userId]
       );
 
-      // Update user subscription status
+      // Update user
       await db.promise().query(
         `UPDATE users SET subscription = 'pro', subscription_status = 'active', 
          subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH)
@@ -228,6 +246,16 @@ exports.confirmDemo = async (req, res) => {
     const userId = await getUserId(firebase_uid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
+    // Get subscription plan
+    const [subs] = await db.promise().query(
+      'SELECT plan, plan_id FROM subscriptions WHERE id = ? AND user_id = ?',
+      [subscription_id, userId]
+    );
+    
+    const sub = subs[0];
+    const planName = sub?.plan || 'pro';
+    const planId = sub?.plan_id;
+
     // Activate subscription
     await db.promise().query(
       `UPDATE subscriptions SET status = 'active', start_date = CURDATE(), 
@@ -245,10 +273,10 @@ exports.confirmDemo = async (req, res) => {
 
     // Update user
     await db.promise().query(
-      `UPDATE users SET subscription = 'pro', subscription_status = 'active', 
+      `UPDATE users SET subscription = ?, subscription_status = 'active', 
        subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH)
        WHERE id = ?`,
-      [userId]
+      [planName, userId]
     );
     
     res.json({ message: 'Subscription activated successfully' });
@@ -266,7 +294,7 @@ exports.cancelSubscription = async (req, res) => {
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
     await db.promise().query(
-      `UPDATE subscriptions SET status = 'cancelled', auto_renew = 0 
+      `UPDATE subscriptions SET status = 'cancelled' 
        WHERE user_id = ? AND status = 'active'`,
       [userId]
     );
