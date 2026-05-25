@@ -24,9 +24,9 @@ async function getMpesaToken() {
 }
 
 // Helper: Get user_id from firebase_uid
-async function getUserId(firebaseUid) {
+async function getUserId(firebase_uid) {
   const [rows] = await db.promise().query(
-    'SELECT id FROM users WHERE firebase_uid = ?', [firebaseUid]
+    'SELECT id FROM users WHERE firebase_uid = ?', [firebase_uid]
   );
   return rows[0]?.id || null;
 }
@@ -44,16 +44,14 @@ exports.getPlans = async (req, res) => {
 };
 
 // GET /api/subscriptions/status?firebase_uid=xxx
-// FIXED: Uses COALESCE to handle both plan (varchar) and plan_id
 exports.getStatus = async (req, res) => {
   try {
-    const firebaseUid = req.query.firebase_uid;
-    if (!firebaseUid) return res.status(400).json({ message: 'firebase_uid required' });
+    const firebase_uid = req.query.firebase_uid;
+    if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
 
-    const userId = await getUserId(firebaseUid);
+    const userId = await getUserId(firebase_uid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
-    // FIXED: Join on plan name since plan_id may be NULL for old records
     const [rows] = await db.promise().query(`
       SELECT s.*, 
         COALESCE(p.name, s.plan, 'starter') as plan_name,
@@ -67,7 +65,6 @@ exports.getStatus = async (req, res) => {
       LIMIT 1
     `, [userId]);
 
-    // If no subscription record, check users table subscription field
     let subscription = rows[0];
     
     if (!subscription) {
@@ -112,19 +109,53 @@ exports.getStatus = async (req, res) => {
 // GET /api/subscriptions/history?firebase_uid=xxx
 exports.getPaymentHistory = async (req, res) => {
   try {
-    const firebaseUid = req.query.firebase_uid;
-    if (!firebaseUid) return res.status(400).json({ message: 'firebase_uid required' });
+    const firebase_uid = req.query.firebase_uid;
+    if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
 
-    const userId = await getUserId(firebaseUid);
+    const userId = await getUserId(firebase_uid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
     const [payments] = await db.promise().query(
-      `SELECT id, amount, phone, mpesa_receipt,  created_at 
+      `SELECT id, amount, phone, mpesa_receipt, checkout_request_id, transaction_date, created_at 
        FROM payments WHERE user_id = ? ORDER BY created_at DESC`,
       [userId]
     );
     
     res.json(payments);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// GET /api/subscriptions/latest-receipt?firebase_uid=xxx
+// NEW: Get the latest mpesa_receipt for demo confirmation
+exports.getLatestReceipt = async (req, res) => {
+  try {
+    const firebase_uid = req.query.firebase_uid;
+    if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
+
+    const userId = await getUserId(firebase_uid);
+    if (!userId) return res.status(404).json({ message: 'User not found' });
+
+    const [rows] = await db.promise().query(
+      `SELECT mpesa_receipt, checkout_request_id, amount, created_at 
+       FROM payments 
+       WHERE user_id = ? AND mpesa_receipt IS NOT NULL 
+       ORDER BY created_at DESC 
+       LIMIT 1`,
+      [userId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ message: 'No receipt found' });
+    }
+
+    res.json({
+      receipt: rows[0].mpesa_receipt,
+      checkout_request_id: rows[0].checkout_request_id,
+      amount: rows[0].amount,
+      date: rows[0].created_at
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -142,7 +173,6 @@ exports.initiatePayment = async (req, res) => {
     const userId = await getUserId(firebase_uid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
-    // Get plan
     const [plans] = await db.promise().query(
       'SELECT * FROM plans WHERE id = ? AND is_active = 1', [plan_id]
     );
@@ -151,29 +181,23 @@ exports.initiatePayment = async (req, res) => {
     const plan = plans[0];
     const reference = `MPESA_${Date.now()}_${userId}`;
 
-    // Insert subscription using BOTH plan_id and plan name for compatibility
     const [subResult] = await db.promise().query(
       `INSERT INTO subscriptions (user_id, plan_id, plan, amount, start_date, end_date, status, payment_reference, created_at)
        VALUES (?, ?, ?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 'pending', ?, NOW())`,
       [userId, plan.id, plan.name, plan.price_kes, reference]
     );
 
-    // Insert payment
     await db.promise().query(
-      `INSERT INTO payments (user_id, amount, phone, subscription, checkout_request_id,  created_at)
-       VALUES (?, ?, ?, ?, ?, NOW())`,
-      [userId, plan.price_kes, phone, plan.name, reference ]
+      `INSERT INTO payments (user_id, amount, phone, subscription, checkout_request_id, mpesa_receipt, transaction_date, created_at)
+       VALUES (?, ?, ?, ?, ?, NULL, NULL, NOW())`,
+      [userId, plan.price_kes, phone, plan.name, reference]
     );
 
-    // === REAL M-PESA STK PUSH (Uncomment for production) ===
-    
     const token = await getMpesaToken();
     const timestamp = new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
     const shortcode = process.env.MP_SHORTCODE_DEV;
     const passkey = process.env.MP_PASSKEY_DEV;
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
-    
-    console.log("token:", token);
     
     await new Promise((resolve, reject) => {
       request.post(
@@ -204,7 +228,6 @@ exports.initiatePayment = async (req, res) => {
         }
       );
     });
-    
 
     res.json({
       message: 'Payment initiated. Check your phone for M-Pesa prompt.',
@@ -220,6 +243,7 @@ exports.initiatePayment = async (req, res) => {
 };
 
 // POST /api/subscriptions/callback (M-Pesa webhook)
+// ONLY updates mpesa_receipt in payments table
 exports.mpesaCallback = async (req, res) => {
   try {
     const { Body } = req.body;
@@ -228,31 +252,39 @@ exports.mpesaCallback = async (req, res) => {
     if (result.ResultCode === 0) {
       const items = result.CallbackMetadata.Item;
       const receipt = items.find(i => i.Name === 'MpesaReceiptNumber')?.Value;
-      const phone = items.find(i => i.Name === 'PhoneNumber')?.Value;
-      const amount = items.find(i => i.Name === 'Amount')?.Value;
       const ref = items.find(i => i.Name === 'AccountReference')?.Value;
       const userId = parseInt(ref?.split('_')[1]) || 1;
+      const checkoutRequestId = result.CheckoutRequestID;
 
-      // Update payment
+      // ONLY update mpesa_receipt in payments table
       await db.promise().query(
-        `UPDATE payments SET status = 'success', mpesa_receipt = ? 
-         WHERE user_id = ? AND amount = ? AND status = 'pending' 
-         ORDER BY id DESC LIMIT 1`,
-        [receipt, userId, amount]
+        `UPDATE payments 
+         SET mpesa_receipt = ?
+         WHERE checkout_request_id = ? 
+           AND user_id = ?`,
+        [receipt, checkoutRequestId, userId]
       );
 
       // Activate subscription
       await db.promise().query(
-        `UPDATE subscriptions SET status = 'active', start_date = CURDATE(), 
-         end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), mpesa_receipt = ? 
-         WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1`,
+        `UPDATE subscriptions 
+         SET status = 'active', 
+             start_date = CURDATE(), 
+             end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 
+             mpesa_receipt = ?
+         WHERE user_id = ? 
+           AND status = 'pending' 
+         ORDER BY id DESC 
+         LIMIT 1`,
         [receipt, userId]
       );
 
       // Update user
       await db.promise().query(
-        `UPDATE users SET subscription = 'pro', subscription_status = 'active', 
-         subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH)
+        `UPDATE users 
+         SET subscription = 'pro', 
+             subscription_status = 'active', 
+             subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH)
          WHERE id = ?`,
         [userId]
       );
@@ -260,11 +292,13 @@ exports.mpesaCallback = async (req, res) => {
     
     res.json({ ResultCode: 0, ResultDesc: 'Success' });
   } catch (error) {
-    res.status(500).json({ ResultCode: 1, ResultDesc: error.message });
+    console.error('Callback error:', error);
+    res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
   }
 };
 
 // POST /api/subscriptions/confirm (Demo/manual confirmation)
+// Uses the REAL mpesa_receipt from the callback instead of 'DEMO_RECEIPT'
 exports.confirmDemo = async (req, res) => {
   try {
     const { subscription_id, firebase_uid } = req.body;
@@ -272,7 +306,19 @@ exports.confirmDemo = async (req, res) => {
     const userId = await getUserId(firebase_uid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
-    // Get subscription plan
+    // Get the REAL receipt from the latest payment record
+    const [paymentRows] = await db.promise().query(
+      `SELECT mpesa_receipt 
+       FROM payments 
+       WHERE user_id = ? AND mpesa_receipt IS NOT NULL 
+       ORDER BY created_at DESC 
+       LIMIT 1`,
+      [userId]
+    );
+
+    // Use real receipt if found, otherwise fallback
+    const realReceipt = paymentRows[0]?.mpesa_receipt || 'DEMO_RECEIPT';
+
     const [subs] = await db.promise().query(
       'SELECT plan, plan_id FROM subscriptions WHERE id = ? AND user_id = ?',
       [subscription_id, userId]
@@ -280,32 +326,32 @@ exports.confirmDemo = async (req, res) => {
     
     const sub = subs[0];
     const planName = sub?.plan || 'pro';
-    const planId = sub?.plan_id;
 
-    // Activate subscription
+    // Activate subscription with REAL receipt
     await db.promise().query(
-      `UPDATE subscriptions SET status = 'active', start_date = CURDATE(), 
-       end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), mpesa_receipt = 'DEMO_RECEIPT' 
+      `UPDATE subscriptions 
+       SET status = 'active', 
+           start_date = CURDATE(), 
+           end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 
+           mpesa_receipt = ?
        WHERE id = ? AND user_id = ?`,
-      [subscription_id, userId]
-    );
-    
-    // Update payment
-    await db.promise().query(
-      `UPDATE payments SET status = 'success', mpesa_receipt = 'DEMO_RECEIPT' 
-       WHERE subscription_id = ?`,
-      [subscription_id]
+      [realReceipt, subscription_id, userId]
     );
 
     // Update user
     await db.promise().query(
-      `UPDATE users SET subscription = ?, subscription_status = 'active', 
-       subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH)
+      `UPDATE users 
+       SET subscription = ?, 
+           subscription_status = 'active', 
+           subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH)
        WHERE id = ?`,
       [planName, userId]
     );
     
-    res.json({ message: 'Subscription activated successfully' });
+    res.json({ 
+      message: 'Subscription activated successfully',
+      receipt_used: realReceipt
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -320,8 +366,10 @@ exports.cancelSubscription = async (req, res) => {
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
     await db.promise().query(
-      `UPDATE subscriptions SET status = 'cancelled' 
-       WHERE user_id = ? AND status = 'active'`,
+      `UPDATE subscriptions 
+       SET status = 'cancelled'
+       WHERE user_id = ? 
+         AND status = 'active'`,
       [userId]
     );
     
