@@ -1,5 +1,5 @@
 const db = require('../config/db');
-const axios = require('axios');
+const request = require('request');
 
 // Helper: Get M-Pesa access token
 async function getMpesaToken() {
@@ -7,11 +7,20 @@ async function getMpesaToken() {
   const consumerSecret = process.env.MP_SECRET_KEY_DEV;
   const auth = Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
   
-  const { data } = await axios.get(
-    'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
-    { headers: { Authorization: `Basic ${auth}` } }
-  );
-  return data.access_token;
+  return new Promise((resolve, reject) => {
+    request.get(
+      {
+        url: 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
+        headers: { Authorization: `Basic ${auth}` },
+        json: true
+      },
+      (error, response, body) => {
+        if (error) return reject(error);
+        if (response.statusCode !== 200) return reject(new Error(`Token request failed: ${response.statusCode}`));
+        resolve(body.access_token);
+      }
+    );
+  });
 }
 
 // Helper: Get user_id from firebase_uid
@@ -167,19 +176,35 @@ exports.initiatePayment = async (req, res) => {
     console.log("token:", token);
     console.log("password:", password);
     
-    await axios.post('https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest', {
-      BusinessShortCode: shortcode,
-      Password: password,
-      Timestamp: timestamp,
-      TransactionType: 'CustomerPayBillOnline',
-      Amount: Math.ceil(plan.price_kes),
-      PartyA: phone,
-      PartyB: shortcode,
-      PhoneNumber: phone,
-      CallBackURL: `${process.env.API_URL}/api/subscriptions/callback`,
-      AccountReference: `MeatPro_${userId}`,
-      TransactionDesc: `MeatPro ${plan.display_name}`
-    }, { headers: { Authorization: `Bearer ${token}` }});
+    await new Promise((resolve, reject) => {
+      request.post(
+        {
+          url: 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            BusinessShortCode: shortcode,
+            Password: password,
+            Timestamp: timestamp,
+            TransactionType: 'CustomerPayBillOnline',
+            Amount: Math.ceil(plan.price_kes),
+            PartyA: phone,
+            PartyB: shortcode,
+            PhoneNumber: phone,
+            CallBackURL: `${process.env.API_URL}/api/subscriptions/callback`,
+            AccountReference: `MeatPro_${userId}`,
+            TransactionDesc: `MeatPro ${plan.display_name}`
+          })
+        },
+        (error, response, body) => {
+          if (error) return reject(error);
+          if (response.statusCode !== 200) return reject(new Error(`STK push failed: ${response.statusCode} - ${body}`));
+          resolve(body);
+        }
+      );
+    });
     
 
     res.json({
