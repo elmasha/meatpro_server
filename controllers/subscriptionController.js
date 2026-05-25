@@ -14,6 +14,14 @@ async function getMpesaToken() {
   return data.access_token;
 }
 
+// Helper: Get user_id from firebase_uid
+async function getUserId(firebaseUid) {
+  const [rows] = await db.promise().query(
+    'SELECT id FROM users WHERE firebase_uid = ?', [firebaseUid]
+  );
+  return rows[0]?.id || null;
+}
+
 // GET /api/plans
 exports.getPlans = async (req, res) => {
   try {
@@ -26,35 +34,39 @@ exports.getPlans = async (req, res) => {
   }
 };
 
-// GET /api/subscriptions/status?business_id=1
+// GET /api/subscriptions/status?firebase_uid=xxx
 exports.getStatus = async (req, res) => {
   try {
-    const business_id = parseInt(req.query.business_id);
-    if (!business_id) return res.status(400).json({ message: 'business_id required' });
+    const firebaseUid = req.query.firebase_uid;
+    if (!firebaseUid) return res.status(400).json({ message: 'firebase_uid required' });
+
+    const userId = await getUserId(firebaseUid);
+    if (!userId) return res.status(404).json({ message: 'User not found' });
 
     const [rows] = await db.promise().query(`
       SELECT s.*, p.name as plan_name, p.display_name, p.price_kes, p.features
       FROM subscriptions s
-      JOIN plans p ON s.plan_id = p.id
-      WHERE s.business_id = ?
+      LEFT JOIN plans p ON s.plan_id = p.id
+      WHERE s.user_id = ?
       ORDER BY s.created_at DESC
       LIMIT 1
-    `, [business_id]);
+    `, [userId]);
 
+    // Fallback to user's subscription string if no subscription record
     const subscription = rows[0] || {
       status: 'expired',
       plan_name: 'starter',
       display_name: 'Starter (Free)',
       plan_id: 1,
-      expires_at: null,
+      end_date: null,
       features: '["1 branch","Daily operations","Basic profit summary","7-day history"]'
     };
 
     const isActive = subscription.status === 'active' && 
-      subscription.expires_at && new Date(subscription.expires_at) > new Date();
+      subscription.end_date && new Date(subscription.end_date) > new Date();
 
     const daysRemaining = isActive 
-      ? Math.ceil((new Date(subscription.expires_at) - new Date()) / (1000 * 60 * 60 * 24))
+      ? Math.ceil((new Date(subscription.end_date) - new Date()) / (1000 * 60 * 60 * 24))
       : 0;
 
     res.json({
@@ -70,16 +82,19 @@ exports.getStatus = async (req, res) => {
   }
 };
 
-// GET /api/subscriptions/history?business_id=1
+// GET /api/subscriptions/history?firebase_uid=xxx
 exports.getPaymentHistory = async (req, res) => {
   try {
-    const business_id = parseInt(req.query.business_id);
-    if (!business_id) return res.status(400).json({ message: 'business_id required' });
+    const firebaseUid = req.query.firebase_uid;
+    if (!firebaseUid) return res.status(400).json({ message: 'firebase_uid required' });
+
+    const userId = await getUserId(firebaseUid);
+    if (!userId) return res.status(404).json({ message: 'User not found' });
 
     const [payments] = await db.promise().query(
       `SELECT id, amount, phone, mpesa_receipt, status, created_at 
-       FROM payments WHERE business_id = ? ORDER BY created_at DESC`,
-      [business_id]
+       FROM payments WHERE user_id = ? ORDER BY created_at DESC`,
+      [userId]
     );
     
     res.json(payments);
@@ -91,11 +106,14 @@ exports.getPaymentHistory = async (req, res) => {
 // POST /api/subscriptions/initiate
 exports.initiatePayment = async (req, res) => {
   try {
-    const { business_id, plan_id, phone } = req.body;
+    const { firebase_uid, plan_id, phone } = req.body;
     
-    if (!business_id || !plan_id || !phone) {
-      return res.status(400).json({ message: 'business_id, plan_id, and phone required' });
+    if (!firebase_uid || !plan_id || !phone) {
+      return res.status(400).json({ message: 'firebase_uid, plan_id, and phone required' });
     }
+
+    const userId = await getUserId(firebase_uid);
+    if (!userId) return res.status(404).json({ message: 'User not found' });
 
     // Get plan
     const [plans] = await db.promise().query(
@@ -104,24 +122,24 @@ exports.initiatePayment = async (req, res) => {
     if (!plans.length) return res.status(400).json({ message: 'Invalid plan' });
     
     const plan = plans[0];
-    const reference = `MPESA_${Date.now()}_${business_id}`;
+    const reference = `MPESA_${Date.now()}_${userId}`;
 
-    // Create pending subscription
+    // Create pending subscription (matches your schema: user_id, plan, amount, start_date, end_date, status)
     const [subResult] = await db.promise().query(
-      `INSERT INTO subscriptions (business_id, plan_id, status, start_date, end_date, payment_reference, created_at)
-       VALUES (?, ?, 'pending', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 MONTH), ?, NOW())`,
-      [business_id, plan_id, reference]
+      `INSERT INTO subscriptions (user_id, plan_id, plan, amount, start_date, end_date, status, payment_reference, created_at)
+       VALUES (?, ?, ?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 'pending', ?, NOW())`,
+      [userId, plan_id, plan.name, plan.price_kes, reference]
     );
 
-    // Log payment
+    // Log payment (matches your schema: user_id, amount, phone, subscription, checkout_request_id)
     await db.promise().query(
-      `INSERT INTO payments (business_id, subscription_id, amount, phone, status, transaction_desc, created_at)
-       VALUES (?, ?, ?, ?, 'pending', ?, NOW())`,
-      [business_id, subResult.insertId, plan.price_kes, phone, `Subscription: ${plan.display_name}`]
+      `INSERT INTO payments (user_id, subscription_id, amount, phone, subscription, checkout_request_id, status, transaction_desc, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NOW())`,
+      [userId, subResult.insertId, plan.price_kes, phone, plan.name, reference, `Subscription: ${plan.display_name}`]
     );
 
     // === REAL M-PESA STK PUSH (Uncomment for production) ===
-    /*
+    
     const token = await getMpesaToken();
     const timestamp = new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
     const shortcode = process.env.MPESA_SHORTCODE;
@@ -138,10 +156,10 @@ exports.initiatePayment = async (req, res) => {
       PartyB: shortcode,
       PhoneNumber: phone,
       CallBackURL: `${process.env.API_URL}/api/subscriptions/callback`,
-      AccountReference: `MeatPro_${business_id}`,
+      AccountReference: `MeatPro_${userId}`,
       TransactionDesc: `MeatPro ${plan.display_name}`
     }, { headers: { Authorization: `Bearer ${token}` }});
-    */
+    
 
     res.json({
       message: 'Payment initiated. Check your phone for M-Pesa prompt.',
@@ -169,29 +187,30 @@ exports.mpesaCallback = async (req, res) => {
       const phone = items.find(i => i.Name === 'PhoneNumber')?.Value;
       const amount = items.find(i => i.Name === 'Amount')?.Value;
       const ref = items.find(i => i.Name === 'AccountReference')?.Value;
-      const business_id = parseInt(ref?.split('_')[1]) || 1;
+      const userId = parseInt(ref?.split('_')[1]) || 1;
 
       // Update payment
       await db.promise().query(
         `UPDATE payments SET status = 'success', mpesa_receipt = ? 
-         WHERE phone = ? AND amount = ? AND status = 'pending' 
+         WHERE user_id = ? AND amount = ? AND status = 'pending' 
          ORDER BY id DESC LIMIT 1`,
-        [receipt, phone, amount]
+        [receipt, userId, amount]
       );
 
       // Activate subscription
       await db.promise().query(
         `UPDATE subscriptions SET status = 'active', start_date = CURDATE(), 
          end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), mpesa_receipt = ? 
-         WHERE business_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1`,
-        [receipt, business_id]
+         WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1`,
+        [receipt, userId]
       );
 
-      // Update user/business subscription status
+      // Update user subscription status
       await db.promise().query(
-        `UPDATE users SET subscription_status = 'active', subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH)
-         WHERE business_id = ?`,
-        [business_id]
+        `UPDATE users SET subscription = 'pro', subscription_status = 'active', 
+         subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH)
+         WHERE id = ?`,
+        [userId]
       );
     }
     
@@ -204,25 +223,32 @@ exports.mpesaCallback = async (req, res) => {
 // POST /api/subscriptions/confirm (Demo/manual confirmation)
 exports.confirmDemo = async (req, res) => {
   try {
-    const { subscription_id, business_id } = req.body;
+    const { subscription_id, firebase_uid } = req.body;
     
+    const userId = await getUserId(firebase_uid);
+    if (!userId) return res.status(404).json({ message: 'User not found' });
+
+    // Activate subscription
     await db.promise().query(
       `UPDATE subscriptions SET status = 'active', start_date = CURDATE(), 
        end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), mpesa_receipt = 'DEMO_RECEIPT' 
-       WHERE id = ?`,
-      [subscription_id]
+       WHERE id = ? AND user_id = ?`,
+      [subscription_id, userId]
     );
     
+    // Update payment
     await db.promise().query(
       `UPDATE payments SET status = 'success', mpesa_receipt = 'DEMO_RECEIPT' 
        WHERE subscription_id = ?`,
       [subscription_id]
     );
 
+    // Update user
     await db.promise().query(
-      `UPDATE users SET subscription_status = 'active', subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH)
-       WHERE business_id = ?`,
-      [business_id]
+      `UPDATE users SET subscription = 'pro', subscription_status = 'active', 
+       subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH)
+       WHERE id = ?`,
+      [userId]
     );
     
     res.json({ message: 'Subscription activated successfully' });
@@ -234,12 +260,15 @@ exports.confirmDemo = async (req, res) => {
 // POST /api/subscriptions/cancel
 exports.cancelSubscription = async (req, res) => {
   try {
-    const { business_id } = req.body;
+    const { firebase_uid } = req.body;
     
+    const userId = await getUserId(firebase_uid);
+    if (!userId) return res.status(404).json({ message: 'User not found' });
+
     await db.promise().query(
       `UPDATE subscriptions SET status = 'cancelled', auto_renew = 0 
-       WHERE business_id = ? AND status = 'active'`,
-      [business_id]
+       WHERE user_id = ? AND status = 'active'`,
+      [userId]
     );
     
     res.json({ message: 'Subscription cancelled. You can use Pro features until expiry.' });
