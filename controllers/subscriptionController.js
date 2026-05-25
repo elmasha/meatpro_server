@@ -126,16 +126,16 @@ exports.initiatePayment = async (req, res) => {
 
     // Create pending subscription (matches your schema: user_id, plan, amount, start_date, end_date, status)
     const [subResult] = await db.promise().query(
-      `INSERT INTO subscriptions (user_id, plan_id, plan, amount, start_date, end_date, status, payment_reference, created_at)
-       VALUES (?, ?, ?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 'pending', ?, NOW())`,
-      [userId, plan_id, plan.name, plan.price_kes, reference]
+      `INSERT INTO subscriptions (user_id,  plan, amount, start_date, end_date, status, payment_reference, created_at)
+       VALUES (?, ?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 'pending', ?, NOW())`,
+      [userId, plan.name, plan.price_kes, reference]
     );
 
     // Log payment (matches your schema: user_id, amount, phone, subscription, checkout_request_id)
     await db.promise().query(
-      `INSERT INTO payments (user_id, subscription_id, amount, phone, subscription, checkout_request_id, status, transaction_desc, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NOW())`,
-      [userId, subResult.insertId, plan.price_kes, phone, plan.name, reference, `Subscription: ${plan.display_name}`]
+      `INSERT INTO payments (user_id,  amount, phone, subscription, checkout_request_id, status, transaction_desc, created_at)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?, NOW())`,
+      [userId, plan.price_kes, phone, plan.name, reference, `Subscription: ${plan.display_name}`]
     );
 
     // === REAL M-PESA STK PUSH (Uncomment for production) ===
