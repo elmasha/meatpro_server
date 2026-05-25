@@ -139,7 +139,7 @@ exports.getLatestReceipt = async (req, res) => {
     const [rows] = await db.promise().query(
       `SELECT mpesa_receipt, checkout_request_id, amount, created_at 
        FROM payments 
-       WHERE user_id = ? AND mpesa_receipt IS NOT NULL 
+       WHERE user_id = ? AND mpesa_receipt IS NOT NULL AND mpesa_receipt != 'FAILED'
        ORDER BY created_at DESC 
        LIMIT 1`,
       [userId]
@@ -161,7 +161,6 @@ exports.getLatestReceipt = async (req, res) => {
 };
 
 // POST /api/subscriptions/initiate
-// UPDATED: Saves M-Pesa CheckoutRequestID from STK push response
 exports.initiatePayment = async (req, res) => {
   try {
     const { firebase_uid, plan_id, phone } = req.body;
@@ -181,14 +180,12 @@ exports.initiatePayment = async (req, res) => {
     const plan = plans[0];
     const reference = `MPESA_${Date.now()}_${userId}`;
 
-    // Insert subscription first
     const [subResult] = await db.promise().query(
       `INSERT INTO subscriptions (user_id, plan_id, plan, amount, start_date, end_date, status, payment_reference, created_at)
        VALUES (?, ?, ?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 'pending', ?, NOW())`,
       [userId, plan.id, plan.name, plan.price_kes, reference]
     );
 
-    // Insert payment with our reference as temporary checkout_request_id
     const [paymentResult] = await db.promise().query(
       `INSERT INTO payments (user_id, amount, phone, subscription, checkout_request_id, mpesa_receipt, transaction_date, created_at)
        VALUES (?, ?, ?, ?, ?, NULL, NULL, NOW())`,
@@ -201,7 +198,6 @@ exports.initiatePayment = async (req, res) => {
     const passkey = process.env.MP_PASSKEY_DEV;
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
 
-    // Make STK push and capture response
     const stkResponse = await new Promise((resolve, reject) => {
       request.post(
         {
@@ -234,7 +230,6 @@ exports.initiatePayment = async (req, res) => {
 
     console.log('STK Response:', stkResponse);
 
-    // UPDATED: Save M-Pesa's CheckoutRequestID to payments table
     if (stkResponse.CheckoutRequestID) {
       await db.promise().query(
         `UPDATE payments 
@@ -242,8 +237,6 @@ exports.initiatePayment = async (req, res) => {
          WHERE id = ?`,
         [stkResponse.CheckoutRequestID, paymentResult.insertId]
       );
-
-      console.log(`Updated payment ${paymentResult.insertId} with CheckoutRequestID: ${stkResponse.CheckoutRequestID}`);
     }
 
     res.json({
@@ -265,40 +258,59 @@ exports.initiatePayment = async (req, res) => {
 };
 
 // POST /api/subscriptions/callback (M-Pesa webhook)
-// UPDATED: Now matches by M-Pesa CheckoutRequestID since we saved it
+// TRANSACTION: All updates wrapped in a single atomic transaction
 exports.mpesaCallback = async (req, res) => {
+  // Get a connection from the pool for transaction
+  const connection = await db.promise().getConnection();
+
   try {
+    await connection.beginTransaction();
+
     const { Body } = req.body;
     const result = Body.stkCallback;
+    const checkoutRequestId = result.CheckoutRequestID;
+
+    console.log('Callback received for CheckoutRequestID:', checkoutRequestId);
 
     if (result.ResultCode === 0) {
       const items = result.CallbackMetadata.Item;
       const receipt = items.find(i => i.Name === 'MpesaReceiptNumber')?.Value;
-      const ref = items.find(i => i.Name === 'AccountReference')?.Value;
-      const checkoutRequestId = result.CheckoutRequestID;
+      const phone = items.find(i => i.Name === 'PhoneNumber')?.Value;
+      const amount = items.find(i => i.Name === 'Amount')?.Value;
+      const transactionDate = items.find(i => i.Name === 'TransactionDate')?.Value;
 
-
-      const [paymentRows] = await db.promise().query(
+      // STEP 1: Look up user_id from payments table using CheckoutRequestID
+      const [paymentRows] = await connection.query(
         'SELECT user_id, id FROM payments WHERE checkout_request_id = ?',
-        [checkoutRequestId]  // ← M-Pesa sends this back, we match exactly
+        [checkoutRequestId]
       );
-      const userId = paymentRows[0].user_id;  // ← Correct user (5, not 1)
 
-      console.log('Callback received:', { receipt, checkoutRequestId, userId });
+      if (!paymentRows.length) {
+        console.error('No payment found for CheckoutRequestID:', checkoutRequestId);
+        await connection.rollback();
+        connection.release();
+        return res.json({ ResultCode: 0, ResultDesc: 'Received' });
+      }
 
-      // UPDATED: Match by M-Pesa's CheckoutRequestID
-      const [updateResult] = await db.promise().query(
+      const userId = paymentRows[0].user_id;
+      const paymentId = paymentRows[0].id;
+
+      console.log('Found payment:', { paymentId, userId, receipt });
+
+      // STEP 2: Update payment using BOTH checkout_request_id AND user_id
+      const [updateResult] = await connection.query(
         `UPDATE payments 
-         SET mpesa_receipt = ?
+         SET mpesa_receipt = ?,
+             transaction_date = ?
          WHERE checkout_request_id = ? 
            AND user_id = ?`,
-        [receipt, checkoutRequestId, userId]
+        [receipt, transactionDate, checkoutRequestId, userId]
       );
 
-      console.log(`Payment update result: ${updateResult.affectedRows} rows affected`);
+      console.log(`Payment updated: ${updateResult.affectedRows} rows, receipt: ${receipt}`);
 
-      // Activate subscription
-      await db.promise().query(
+      // STEP 3: Activate subscription
+      const [subResult] = await connection.query(
         `UPDATE subscriptions 
          SET status = 'active', 
              start_date = CURDATE(), 
@@ -311,48 +323,68 @@ exports.mpesaCallback = async (req, res) => {
         [receipt, userId]
       );
 
-      // Update user
-      await db.promise().query(
+      console.log(`Subscription updated: ${subResult.affectedRows} rows`);
+
+      // STEP 4: Update user - INCLUDING mpesa_receipt and payment_date
+      const [userResult] = await connection.query(
         `UPDATE users 
          SET subscription = 'pro', 
              subscription_status = 'active', 
-             subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH)
+             subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH),
+             mpesa_receipt = ?,
+             payment_date = NOW()
          WHERE id = ?`,
-        [userId]
+        [receipt, userId]
       );
+
+      console.log(`User updated: ${userResult.affectedRows} rows, mpesa_receipt: ${receipt}`);
+
+      // COMMIT: All updates succeed together
+      await connection.commit();
+      console.log(`✅ TRANSACTION COMMITTED for user ${userId}, receipt: ${receipt}`);
     } else {
-      // Payment failed - log it
+      // Payment failed - still commit the "FAILED" status
       console.log('M-Pesa payment failed:', result.ResultDesc);
 
-      // Optionally update payment record to mark as failed
-      const checkoutRequestId = result.CheckoutRequestID;
-      if (checkoutRequestId) {
-        await db.promise().query(
-          `UPDATE payments 
-           SET mpesa_receipt = 'FAILED'
-           WHERE checkout_request_id = ?`,
-          [checkoutRequestId]
-        );
-      }
+      await connection.query(
+        `UPDATE payments 
+         SET mpesa_receipt = 'FAILED'
+         WHERE checkout_request_id = ?`,
+        [checkoutRequestId]
+      );
+
+      await connection.commit();
+      console.log('Transaction committed with FAILED status');
     }
 
+    connection.release();
     res.json({ ResultCode: 0, ResultDesc: 'Success' });
   } catch (error) {
-    console.error('Callback error:', error);
+    // ROLLBACK: If anything fails, undo all changes
+    await connection.rollback();
+    connection.release();
+    console.error('Callback error - TRANSACTION ROLLED BACK:', error);
     res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
   }
 };
 
 // POST /api/subscriptions/confirm (Demo/manual confirmation)
+// TRANSACTION: All updates wrapped in a single atomic transaction
 exports.confirmDemo = async (req, res) => {
+  const connection = await db.promise().getConnection();
+
   try {
+    await connection.beginTransaction();
+
     const { subscription_id, firebase_uid } = req.body;
 
     const userId = await getUserId(firebase_uid);
-    if (!userId) return res.status(404).json({ message: 'User not found' });
+    if (!userId) {
+      connection.release();
+      return res.status(404).json({ message: 'User not found' });
+    }
 
-    // Get the REAL receipt from the latest payment record
-    const [paymentRows] = await db.promise().query(
+    const [paymentRows] = await connection.query(
       `SELECT mpesa_receipt 
        FROM payments 
        WHERE user_id = ? AND mpesa_receipt IS NOT NULL AND mpesa_receipt != 'FAILED'
@@ -363,7 +395,7 @@ exports.confirmDemo = async (req, res) => {
 
     const realReceipt = paymentRows[0]?.mpesa_receipt || 'DEMO_RECEIPT';
 
-    const [subs] = await db.promise().query(
+    const [subs] = await connection.query(
       'SELECT plan, plan_id FROM subscriptions WHERE id = ? AND user_id = ?',
       [subscription_id, userId]
     );
@@ -371,8 +403,7 @@ exports.confirmDemo = async (req, res) => {
     const sub = subs[0];
     const planName = sub?.plan || 'pro';
 
-    // Activate subscription with REAL receipt
-    await db.promise().query(
+    await connection.query(
       `UPDATE subscriptions 
        SET status = 'active', 
            start_date = CURDATE(), 
@@ -382,21 +413,28 @@ exports.confirmDemo = async (req, res) => {
       [realReceipt, subscription_id, userId]
     );
 
-    // Update user
-    await db.promise().query(
+    await connection.query(
       `UPDATE users 
        SET subscription = ?, 
            subscription_status = 'active', 
-           subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH)
+           subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH),
+           mpesa_receipt = ?,
+           payment_date = NOW()
        WHERE id = ?`,
-      [planName, userId]
+      [planName, realReceipt, userId]
     );
+
+    await connection.commit();
+    connection.release();
 
     res.json({ 
       message: 'Subscription activated successfully',
       receipt_used: realReceipt
     });
   } catch (error) {
+    await connection.rollback();
+    connection.release();
+    console.error('confirmDemo error - TRANSACTION ROLLED BACK:', error);
     res.status(500).json({ message: error.message });
   }
 };
