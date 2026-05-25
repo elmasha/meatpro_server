@@ -174,7 +174,6 @@ exports.initiatePayment = async (req, res) => {
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
     
     console.log("token:", token);
-    console.log("password:", password);
     
     await new Promise((resolve, reject) => {
       request.post(
@@ -209,7 +208,6 @@ exports.initiatePayment = async (req, res) => {
 
     res.json({
       message: 'Payment initiated. Check your phone for M-Pesa prompt.',
-      subscription_id: subResult.insertId,
       amount: plan.price_kes,
       phone: phone,
       reference: reference,
