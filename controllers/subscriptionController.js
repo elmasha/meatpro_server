@@ -164,6 +164,9 @@ exports.initiatePayment = async (req, res) => {
     const passkey = process.env.MP_PASSKEY_DEV;
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
     
+    console.log("token:", token);
+    console.log("password:", password);
+    
     await axios.post('https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest', {
       BusinessShortCode: shortcode,
       Password: password,
