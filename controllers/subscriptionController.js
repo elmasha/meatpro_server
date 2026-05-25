@@ -110,7 +110,7 @@ exports.getPaymentHistory = async (req, res) => {
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
     const [payments] = await db.promise().query(
-      `SELECT id, amount, phone, mpesa_receipt, status, created_at 
+      `SELECT id, amount, phone, mpesa_receipt,  created_at 
        FROM payments WHERE user_id = ? ORDER BY created_at DESC`,
       [userId]
     );
