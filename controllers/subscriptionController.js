@@ -151,9 +151,9 @@ exports.initiatePayment = async (req, res) => {
 
     // Insert payment
     await db.promise().query(
-      `INSERT INTO payments (user_id, amount, phone, subscription, checkout_request_id, transaction_desc, created_at)
-       VALUES (?, ?, ?, ?, ?,  ?, NOW())`,
-      [userId, subResult.insertId, plan.price_kes, phone, plan.name, reference, `Subscription: ${plan.display_name}`]
+      `INSERT INTO payments (user_id, amount, phone, subscription, checkout_request_id,  created_at)
+       VALUES (?, ?, ?, ?, ?, NOW())`,
+      [userId, plan.price_kes, phone, plan.name, reference ]
     );
 
     // === REAL M-PESA STK PUSH (Uncomment for production) ===
