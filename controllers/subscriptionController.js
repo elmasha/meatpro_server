@@ -6,7 +6,7 @@ async function getMpesaToken() {
   const consumerKey = process.env.MP_CONSUMER_KEY_DEV;
   const consumerSecret = process.env.MP_SECRET_KEY_DEV;
   const auth = Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
-  
+
   return new Promise((resolve, reject) => {
     request.get(
       {
@@ -66,14 +66,14 @@ exports.getStatus = async (req, res) => {
     `, [userId]);
 
     let subscription = rows[0];
-    
+
     if (!subscription) {
       const [userRows] = await db.promise().query(
         'SELECT subscription, subscription_status, subscription_expires FROM users WHERE id = ?',
         [userId]
       );
       const userSub = userRows[0];
-      
+
       subscription = {
         status: userSub?.subscription_status || 'expired',
         plan: userSub?.subscription || 'starter',
@@ -120,7 +120,7 @@ exports.getPaymentHistory = async (req, res) => {
        FROM payments WHERE user_id = ? ORDER BY created_at DESC`,
       [userId]
     );
-    
+
     res.json(payments);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -128,7 +128,6 @@ exports.getPaymentHistory = async (req, res) => {
 };
 
 // GET /api/subscriptions/latest-receipt?firebase_uid=xxx
-// NEW: Get the latest mpesa_receipt for demo confirmation
 exports.getLatestReceipt = async (req, res) => {
   try {
     const firebase_uid = req.query.firebase_uid;
@@ -165,7 +164,7 @@ exports.getLatestReceipt = async (req, res) => {
 exports.initiatePayment = async (req, res) => {
   try {
     const { firebase_uid, plan_id, phone } = req.body;
-    
+
     if (!firebase_uid || !plan_id || !phone) {
       return res.status(400).json({ message: 'firebase_uid, plan_id, and phone required' });
     }
@@ -177,7 +176,7 @@ exports.initiatePayment = async (req, res) => {
       'SELECT * FROM plans WHERE id = ? AND is_active = 1', [plan_id]
     );
     if (!plans.length) return res.status(400).json({ message: 'Invalid plan' });
-    
+
     const plan = plans[0];
     const reference = `MPESA_${Date.now()}_${userId}`;
 
@@ -187,6 +186,7 @@ exports.initiatePayment = async (req, res) => {
       [userId, plan.id, plan.name, plan.price_kes, reference]
     );
 
+    // FIXED: Store our reference in checkout_request_id for matching later
     await db.promise().query(
       `INSERT INTO payments (user_id, amount, phone, subscription, checkout_request_id, mpesa_receipt, transaction_date, created_at)
        VALUES (?, ?, ?, ?, ?, NULL, NULL, NOW())`,
@@ -198,7 +198,7 @@ exports.initiatePayment = async (req, res) => {
     const shortcode = process.env.MP_SHORTCODE_DEV;
     const passkey = process.env.MP_PASSKEY_DEV;
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
-    
+
     await new Promise((resolve, reject) => {
       request.post(
         {
@@ -236,19 +236,19 @@ exports.initiatePayment = async (req, res) => {
       reference: reference,
       demo_mode: true
     });
-    
+
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
 // POST /api/subscriptions/callback (M-Pesa webhook)
-// ONLY updates mpesa_receipt in payments table
+// FIXED: Matches by AccountReference (which contains userId) and updates latest pending payment
 exports.mpesaCallback = async (req, res) => {
   try {
     const { Body } = req.body;
     const result = Body.stkCallback;
-    
+
     if (result.ResultCode === 0) {
       const items = result.CallbackMetadata.Item;
       const receipt = items.find(i => i.Name === 'MpesaReceiptNumber')?.Value;
@@ -256,12 +256,17 @@ exports.mpesaCallback = async (req, res) => {
       const userId = parseInt(ref?.split('_')[1]) || 1;
       const checkoutRequestId = result.CheckoutRequestID;
 
-      // ONLY update mpesa_receipt in payments table
+      // FIXED: Update the LATEST pending payment for this user
+      // We match by user_id + NULL mpesa_receipt (pending) instead of checkout_request_id
+      // because M-Pesa's CheckoutRequestID != our reference
       await db.promise().query(
         `UPDATE payments 
-         SET mpesa_receipt = ?
-         WHERE checkout_request_id = ? 
-           AND user_id = ?`,
+         SET mpesa_receipt = ?,
+             checkout_request_id = ?
+         WHERE user_id = ? 
+           AND mpesa_receipt IS NULL
+         ORDER BY created_at DESC
+         LIMIT 1`,
         [receipt, checkoutRequestId, userId]
       );
 
@@ -288,21 +293,24 @@ exports.mpesaCallback = async (req, res) => {
          WHERE id = ?`,
         [userId]
       );
+    } else {
+      // Payment failed - log it but don't fail the response
+      console.log('M-Pesa payment failed:', result.ResultDesc);
     }
-    
+
     res.json({ ResultCode: 0, ResultDesc: 'Success' });
   } catch (error) {
     console.error('Callback error:', error);
+    // Always return 200 to M-Pesa so they don't retry
     res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
   }
 };
 
 // POST /api/subscriptions/confirm (Demo/manual confirmation)
-// Uses the REAL mpesa_receipt from the callback instead of 'DEMO_RECEIPT'
 exports.confirmDemo = async (req, res) => {
   try {
     const { subscription_id, firebase_uid } = req.body;
-    
+
     const userId = await getUserId(firebase_uid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
@@ -316,14 +324,13 @@ exports.confirmDemo = async (req, res) => {
       [userId]
     );
 
-    // Use real receipt if found, otherwise fallback
     const realReceipt = paymentRows[0]?.mpesa_receipt || 'DEMO_RECEIPT';
 
     const [subs] = await db.promise().query(
       'SELECT plan, plan_id FROM subscriptions WHERE id = ? AND user_id = ?',
       [subscription_id, userId]
     );
-    
+
     const sub = subs[0];
     const planName = sub?.plan || 'pro';
 
@@ -347,7 +354,7 @@ exports.confirmDemo = async (req, res) => {
        WHERE id = ?`,
       [planName, userId]
     );
-    
+
     res.json({ 
       message: 'Subscription activated successfully',
       receipt_used: realReceipt
@@ -361,7 +368,7 @@ exports.confirmDemo = async (req, res) => {
 exports.cancelSubscription = async (req, res) => {
   try {
     const { firebase_uid } = req.body;
-    
+
     const userId = await getUserId(firebase_uid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
@@ -372,7 +379,7 @@ exports.cancelSubscription = async (req, res) => {
          AND status = 'active'`,
       [userId]
     );
-    
+
     res.json({ message: 'Subscription cancelled. You can use Pro features until expiry.' });
   } catch (error) {
     res.status(500).json({ message: error.message });
