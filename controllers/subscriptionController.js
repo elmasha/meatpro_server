@@ -275,8 +275,14 @@ exports.mpesaCallback = async (req, res) => {
       const items = result.CallbackMetadata.Item;
       const receipt = items.find(i => i.Name === 'MpesaReceiptNumber')?.Value;
       const ref = items.find(i => i.Name === 'AccountReference')?.Value;
-      const userId = parseInt(ref?.split('_')[1]) || 1;
       const checkoutRequestId = result.CheckoutRequestID;
+
+
+      const [paymentRows] = await db.promise().query(
+        'SELECT user_id, id FROM payments WHERE checkout_request_id = ?',
+        [checkoutRequestId]  // ← M-Pesa sends this back, we match exactly
+      );
+      const userId = paymentRows[0].user_id;  // ← Correct user (5, not 1)
 
       console.log('Callback received:', { receipt, checkoutRequestId, userId });
 
