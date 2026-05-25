@@ -161,6 +161,7 @@ exports.getLatestReceipt = async (req, res) => {
 };
 
 // POST /api/subscriptions/initiate
+// UPDATED: Saves M-Pesa CheckoutRequestID from STK push response
 exports.initiatePayment = async (req, res) => {
   try {
     const { firebase_uid, plan_id, phone } = req.body;
@@ -180,14 +181,15 @@ exports.initiatePayment = async (req, res) => {
     const plan = plans[0];
     const reference = `MPESA_${Date.now()}_${userId}`;
 
+    // Insert subscription first
     const [subResult] = await db.promise().query(
       `INSERT INTO subscriptions (user_id, plan_id, plan, amount, start_date, end_date, status, payment_reference, created_at)
        VALUES (?, ?, ?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 'pending', ?, NOW())`,
       [userId, plan.id, plan.name, plan.price_kes, reference]
     );
 
-    // FIXED: Store our reference in checkout_request_id for matching later
-    await db.promise().query(
+    // Insert payment with our reference as temporary checkout_request_id
+    const [paymentResult] = await db.promise().query(
       `INSERT INTO payments (user_id, amount, phone, subscription, checkout_request_id, mpesa_receipt, transaction_date, created_at)
        VALUES (?, ?, ?, ?, ?, NULL, NULL, NOW())`,
       [userId, plan.price_kes, phone, plan.name, reference]
@@ -199,7 +201,8 @@ exports.initiatePayment = async (req, res) => {
     const passkey = process.env.MP_PASSKEY_DEV;
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
 
-    await new Promise((resolve, reject) => {
+    // Make STK push and capture response
+    const stkResponse = await new Promise((resolve, reject) => {
       request.post(
         {
           url: 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
@@ -224,26 +227,45 @@ exports.initiatePayment = async (req, res) => {
         (error, response, body) => {
           if (error) return reject(error);
           if (response.statusCode !== 200) return reject(new Error(`STK push failed: ${response.statusCode} - ${body}`));
-          resolve(body);
+          resolve(JSON.parse(body));
         }
       );
     });
+
+    console.log('STK Response:', stkResponse);
+
+    // UPDATED: Save M-Pesa's CheckoutRequestID to payments table
+    if (stkResponse.CheckoutRequestID) {
+      await db.promise().query(
+        `UPDATE payments 
+         SET checkout_request_id = ?
+         WHERE id = ?`,
+        [stkResponse.CheckoutRequestID, paymentResult.insertId]
+      );
+
+      console.log(`Updated payment ${paymentResult.insertId} with CheckoutRequestID: ${stkResponse.CheckoutRequestID}`);
+    }
 
     res.json({
       message: 'Payment initiated. Check your phone for M-Pesa prompt.',
       amount: plan.price_kes,
       phone: phone,
       reference: reference,
+      checkout_request_id: stkResponse.CheckoutRequestID || null,
+      merchant_request_id: stkResponse.MerchantRequestID || null,
+      response_code: stkResponse.ResponseCode,
+      response_description: stkResponse.ResponseDescription,
       demo_mode: true
     });
 
   } catch (error) {
+    console.error('Initiate error:', error);
     res.status(500).json({ message: error.message });
   }
 };
 
 // POST /api/subscriptions/callback (M-Pesa webhook)
-// FIXED: Matches by AccountReference (which contains userId) and updates latest pending payment
+// UPDATED: Now matches by M-Pesa CheckoutRequestID since we saved it
 exports.mpesaCallback = async (req, res) => {
   try {
     const { Body } = req.body;
@@ -256,19 +278,18 @@ exports.mpesaCallback = async (req, res) => {
       const userId = parseInt(ref?.split('_')[1]) || 1;
       const checkoutRequestId = result.CheckoutRequestID;
 
-      // FIXED: Update the LATEST pending payment for this user
-      // We match by user_id + NULL mpesa_receipt (pending) instead of checkout_request_id
-      // because M-Pesa's CheckoutRequestID != our reference
-      await db.promise().query(
+      console.log('Callback received:', { receipt, checkoutRequestId, userId });
+
+      // UPDATED: Match by M-Pesa's CheckoutRequestID
+      const [updateResult] = await db.promise().query(
         `UPDATE payments 
-         SET mpesa_receipt = ?,
-             checkout_request_id = ?
-         WHERE user_id = ? 
-           AND mpesa_receipt IS NULL
-         ORDER BY created_at DESC
-         LIMIT 1`,
+         SET mpesa_receipt = ?
+         WHERE checkout_request_id = ? 
+           AND user_id = ?`,
         [receipt, checkoutRequestId, userId]
       );
+
+      console.log(`Payment update result: ${updateResult.affectedRows} rows affected`);
 
       // Activate subscription
       await db.promise().query(
@@ -294,14 +315,24 @@ exports.mpesaCallback = async (req, res) => {
         [userId]
       );
     } else {
-      // Payment failed - log it but don't fail the response
+      // Payment failed - log it
       console.log('M-Pesa payment failed:', result.ResultDesc);
+
+      // Optionally update payment record to mark as failed
+      const checkoutRequestId = result.CheckoutRequestID;
+      if (checkoutRequestId) {
+        await db.promise().query(
+          `UPDATE payments 
+           SET mpesa_receipt = 'FAILED'
+           WHERE checkout_request_id = ?`,
+          [checkoutRequestId]
+        );
+      }
     }
 
     res.json({ ResultCode: 0, ResultDesc: 'Success' });
   } catch (error) {
     console.error('Callback error:', error);
-    // Always return 200 to M-Pesa so they don't retry
     res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
   }
 };
@@ -318,7 +349,7 @@ exports.confirmDemo = async (req, res) => {
     const [paymentRows] = await db.promise().query(
       `SELECT mpesa_receipt 
        FROM payments 
-       WHERE user_id = ? AND mpesa_receipt IS NOT NULL 
+       WHERE user_id = ? AND mpesa_receipt IS NOT NULL AND mpesa_receipt != 'FAILED'
        ORDER BY created_at DESC 
        LIMIT 1`,
       [userId]
