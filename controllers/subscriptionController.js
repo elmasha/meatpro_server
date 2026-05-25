@@ -3,8 +3,8 @@ const axios = require('axios');
 
 // Helper: Get M-Pesa access token
 async function getMpesaToken() {
-  const consumerKey = process.env.MPESA_CONSUMER_KEY;
-  const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
+  const consumerKey = process.env.MP_CONSUMER_KEY_DEV;
+  const consumerSecret = process.env.MP_SECRET_KEY_DEV;
   const auth = Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
   
   const { data } = await axios.get(
@@ -151,17 +151,17 @@ exports.initiatePayment = async (req, res) => {
 
     // Insert payment
     await db.promise().query(
-      `INSERT INTO payments (user_id, subscription_id, amount, phone, subscription, checkout_request_id, status, transaction_desc, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NOW())`,
+      `INSERT INTO payments (user_id, amount, phone, subscription, checkout_request_id, transaction_desc, created_at)
+       VALUES (?, ?, ?, ?, ?,  ?, NOW())`,
       [userId, subResult.insertId, plan.price_kes, phone, plan.name, reference, `Subscription: ${plan.display_name}`]
     );
 
     // === REAL M-PESA STK PUSH (Uncomment for production) ===
-    /*
+    
     const token = await getMpesaToken();
     const timestamp = new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
-    const shortcode = process.env.MPESA_SHORTCODE;
-    const passkey = process.env.MPESA_PASSKEY;
+    const shortcode = process.env.MP_SHORTCODE_DEV;
+    const passkey = process.env.MP_PASSKEY_DEV;
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
     
     await axios.post('https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest', {
@@ -177,7 +177,7 @@ exports.initiatePayment = async (req, res) => {
       AccountReference: `MeatPro_${userId}`,
       TransactionDesc: `MeatPro ${plan.display_name}`
     }, { headers: { Authorization: `Bearer ${token}` }});
-    */
+    
 
     res.json({
       message: 'Payment initiated. Check your phone for M-Pesa prompt.',
