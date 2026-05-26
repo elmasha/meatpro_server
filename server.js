@@ -29,7 +29,10 @@ app.use('/api', require('./routes/subscriptionRoutes'));
 app.use('/api', require('./routes/businessRoutes'));
 
 
+const adminRoutes = require('./routes/adminRoutes');
 
+// Mount under /api/admin (after your auth middleware)
+app.use('/api/admin', require('./routes/adminRoutes'));
 
 const PORT = process.env.PORT || 5000;
 // Base route
