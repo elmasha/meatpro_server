@@ -1,14 +1,14 @@
 const db = require('../config/db');
 
 // ==================== SIMPLE ADMIN MIDDLEWARE ====================
-// NO Firebase token verification. Frontend sends x-firebase-uid header.
-// We just check if that uid exists in users table and is Admin.
+// Accept uid from query param OR header
 exports.requireAdmin = async (req, res, next) => {
   try {
-    const firebaseUid = req.headers['x-firebase-uid'];
+    // Try query param first, then header
+    const firebaseUid = req.query.uid || req.headers['x-firebase-uid'];
     
     if (!firebaseUid) {
-      return res.status(401).json({ error: 'x-firebase-uid header required' });
+      return res.status(401).json({ error: 'Authentication required. Provide uid parameter or x-firebase-uid header' });
     }
 
     const [users] = await db.promise().query(
@@ -24,7 +24,8 @@ exports.requireAdmin = async (req, res, next) => {
       return res.status(403).json({ error: 'Admin access required' });
     }
 
-    req.adminUser = users[0]; // Attach admin info to request
+    req.adminUser = users[0];
+    req.firebaseUid = firebaseUid; // Store for later use
     next();
   } catch (err) {
     res.status(500).json({ error: err.message });
