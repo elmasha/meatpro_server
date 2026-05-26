@@ -2,35 +2,35 @@ const db = require('../config/db');
 
 // ==================== SIMPLE ADMIN MIDDLEWARE ====================
 // Accept uid from query param OR header
-exports.requireAdmin = async (req, res, next) => {
-  try {
-    // Try query param first, then header
-    const firebaseUid = req.query.uid || req.headers['x-firebase-uid'];
+// exports.requireAdmin = async (req, res, next) => {
+//   try {
+//     // Try query param first, then header
+//     const firebaseUid = req.query.uid || req.headers['x-firebase-uid'];
     
-    if (!firebaseUid) {
-      return res.status(401).json({ error: 'Authentication required. Provide uid parameter or x-firebase-uid header' });
-    }
+//     if (!firebaseUid) {
+//       return res.status(401).json({ error: 'Authentication required. Provide uid parameter or x-firebase-uid header' });
+//     }
 
-    const [users] = await db.promise().query(
-      'SELECT id, user_type, name FROM users WHERE firebase_uid = ? LIMIT 1',
-      [firebaseUid]
-    );
+//     const [users] = await db.promise().query(
+//       'SELECT id, user_type, name FROM users WHERE firebase_uid = ? LIMIT 1',
+//       [firebaseUid]
+//     );
 
-    if (!users.length) {
-      return res.status(401).json({ error: 'User not found' });
-    }
+//     if (!users.length) {
+//       return res.status(401).json({ error: 'User not found' });
+//     }
 
-    if (users[0].user_type !== 'Admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
+//     if (users[0].user_type !== 'Admin') {
+//       return res.status(403).json({ error: 'Admin access required' });
+//     }
 
-    req.adminUser = users[0];
-    req.firebaseUid = firebaseUid; // Store for later use
-    next();
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-};
+//     req.adminUser = users[0];
+//     req.firebaseUid = firebaseUid; // Store for later use
+//     next();
+//   } catch (err) {
+//     res.status(500).json({ error: err.message });
+//   }
+// };
 
 // ==================== DASHBOARD STATS ====================
 exports.getDashboardStats = async (req, res) => {
