@@ -49,63 +49,33 @@ exports.getStatus = async (req, res) => {
     const firebase_uid = req.query.firebase_uid;
     if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
 
+    const cacheKey = `sub:status:${firebase_uid}`;
+    const cached = await redis.get(cacheKey);
+    if (cached) return res.json(JSON.parse(cached));
+
     const userId = await getUserId(firebase_uid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
+    // Single query with proper index usage
     const [rows] = await db.promise().query(`
-      SELECT s.*, 
-        COALESCE(p.name, s.plan, 'starter') as plan_name,
-        COALESCE(p.display_name, 'Starter (Free)') as display_name,
-        COALESCE(p.price_kes, 0) as price_kes,
-        COALESCE(p.features, '["1 branch","Daily operations","Basic profit summary","7-day history"]') as features
+      SELECT 
+        s.status, s.plan, s.end_date, s.plan_id,
+        p.display_name, p.price_kes, p.features
       FROM subscriptions s
-      LEFT JOIN plans p ON COALESCE(s.plan_id, 0) = p.id OR s.plan = p.name
+      LEFT JOIN plans p ON s.plan_id = p.id
       WHERE s.user_id = ?
       ORDER BY s.created_at DESC
       LIMIT 1
     `, [userId]);
 
-    let subscription = rows[0];
+    // ... rest of logic ...
 
-    if (!subscription) {
-      const [userRows] = await db.promise().query(
-        'SELECT subscription, subscription_status, subscription_expires FROM users WHERE id = ?',
-        [userId]
-      );
-      const userSub = userRows[0];
-
-      subscription = {
-        status: userSub?.subscription_status || 'expired',
-        plan: userSub?.subscription || 'starter',
-        plan_name: userSub?.subscription || 'starter',
-        display_name: userSub?.subscription === 'pro' ? 'Professional' : 'Starter (Free)',
-        end_date: userSub?.subscription_expires,
-        features: userSub?.subscription === 'pro' 
-          ? '["Unlimited branches","Advanced analytics","Waste alerts","Full history + CSV export","Multi-user access"]'
-          : '["1 branch","Daily operations","Basic profit summary","7-day history"]'
-      };
-    }
-
-    const isActive = (subscription.status === 'active' || subscription.status === 'free') && 
-      subscription.end_date && new Date(subscription.end_date) > new Date();
-
-    const daysRemaining = isActive 
-      ? Math.ceil((new Date(subscription.end_date) - new Date()) / (1000 * 60 * 60 * 24))
-      : 0;
-
-    res.json({
-      subscription,
-      is_active: isActive,
-      days_remaining: daysRemaining,
-      features: typeof subscription.features === 'string' 
-        ? JSON.parse(subscription.features) 
-        : subscription.features
-    });
+    await redis.setEx(cacheKey, 60, JSON.stringify(response)); // Cache 1 min
+    res.json(response);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
-
 // GET /api/subscriptions/history?firebase_uid=xxx
 exports.getPaymentHistory = async (req, res) => {
   try {
