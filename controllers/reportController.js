@@ -173,7 +173,7 @@ const cacheKey = (prefix, branch_id, params = '') => `report:${prefix}:${branch_
 // WASTE ANALYSIS
 exports.getWasteAnalysis = async (req, res) => {
   try {
-    const { branch_id, days = 30 } = req.query;
+    const { branch_id, days = 7 } = req.query;
     const key = cacheKey('waste', branch_id, days);
     
     const cached = await redis.get(key);
@@ -205,7 +205,7 @@ exports.getWasteAnalysis = async (req, res) => {
 // PAYMENT MIX
 exports.getPaymentMix = async (req, res) => {
   try {
-    const { branch_id, days = 30 } = req.query;
+    const { branch_id, days = 7 } = req.query;
     const key = cacheKey('payment', branch_id, days);
     
     const cached = await redis.get(key);
@@ -242,7 +242,7 @@ exports.getPaymentMix = async (req, res) => {
 // PROFITABILITY TREND
 exports.getProfitability = async (req, res) => {
   try {
-    const { branch_id, days = 30 } = req.query;
+    const { branch_id, days = 7 } = req.query;
     const key = cacheKey('profit', branch_id, days);
     
     const cached = await redis.get(key);
@@ -284,7 +284,7 @@ exports.getProfitability = async (req, res) => {
 // EXPENSE BREAKDOWN
 exports.getExpenseBreakdown = async (req, res) => {
   try {
-    const { branch_id, days = 30 } = req.query;
+    const { branch_id, days = 7 } = req.query;
     const key = cacheKey('expense', branch_id, days);
     
     const cached = await redis.get(key);
