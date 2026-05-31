@@ -431,3 +431,61 @@ exports.cancelSubscription = async (req, res) => {
   }
 };
 
+
+// ==================== STK QUERY (Check Payment Status) ====================
+exports.queryStkStatus = async (req, res) => {
+  try {
+    const { checkout_request_id } = req.body;
+
+    if (!checkout_request_id) {
+      return res.status(400).json({ message: 'checkout_request_id is required' });
+    }
+
+    const token = await getMpesaToken();
+    const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
+    const shortcode = process.env.MP_SHORTCODE_DEV;
+    const passkey = process.env.MP_PASSKEY_DEV;
+    const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
+
+    const queryResponse = await new Promise((resolve, reject) => {
+      request.post(
+        {
+          url: 'https://sandbox.safaricom.co.ke/mpesa/stkpushquery/v1/query',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          json: {
+            BusinessShortCode: shortcode,
+            Password: password,
+            Timestamp: timestamp,
+            CheckoutRequestID: checkout_request_id
+          }
+        },
+        (error, response, body) => {
+          if (error) return reject(error);
+          resolve({
+            statusCode: response.statusCode,
+            body: body
+          });
+        }
+      );
+    });
+
+    const result = queryResponse.body;
+
+    res.json({
+      success: true,
+      status: result.ResultCode === '0' ? 'success' : 'pending',
+      result_code: result.ResultCode,
+      result_desc: result.ResultDesc,
+      checkout_request_id: checkout_request_id,
+      raw_response: result
+    });
+
+  } catch (error) {
+    console.error('STK Query error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
