@@ -3,14 +3,14 @@ const request = require('request');
 
 // Helper: Get M-Pesa access token
 async function getMpesaToken() {
-  const consumerKey = process.env.MP_CONSUMER_KEY_DEV;
-  const consumerSecret = process.env.MP_SECRET_KEY_DEV;
+  const consumerKey = process.env.PROD_CONSUMER_KEY_DEV;
+  const consumerSecret = process.env.PROD_SECRET_KEY_DEV;
   const auth = Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
 
   return new Promise((resolve, reject) => {
     request.get(
       {
-        url: 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
+        url: 'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
         headers: { Authorization: `Basic ${auth}` },
         json: true
       },
@@ -164,14 +164,14 @@ exports.initiatePayment = async (req, res) => {
 
     const token = await getMpesaToken();
     const timestamp = new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
-    const shortcode = process.env.MP_SHORTCODE_DEV;
-    const passkey = process.env.MP_PASSKEY_DEV;
+    const shortcode = process.env.PROD_SHORTCODE_DEV;
+    const passkey = process.env.PROD_PASSKEY_DEV;
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
 
     const stkResponse = await new Promise((resolve, reject) => {
       request.post(
         {
-          url: 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+          url: 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
           headers: {
             Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json'
@@ -443,14 +443,14 @@ exports.queryStkStatus = async (req, res) => {
 
     const token = await getMpesaToken();
     const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
-    const shortcode = process.env.MP_SHORTCODE_DEV;
-    const passkey = process.env.MP_PASSKEY_DEV;
+    const shortcode = process.env.PROD_SHORTCODE_DEV;
+    const passkey = process.env.PROD_PASSKEY_DEV;
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
 
     const queryResponse = await new Promise((resolve, reject) => {
       request.post(
         {
-          url: 'https://sandbox.safaricom.co.ke/mpesa/stkpushquery/v1/query',
+          url: 'https://api.safaricom.co.ke/mpesa/stkpushquery/v1/query',
           headers: {
             Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json'
