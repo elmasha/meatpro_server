@@ -418,7 +418,7 @@ exports.getRevenueReport = async (req, res) => {
       ORDER BY period DESC
     `, [start_date || '2024-01-01', end_date || '2030-12-31']);
 
-    const [summary] = await db.promise().query(`
+    const [[summary]] = await db.promise().query(`
       SELECT 
         COALESCE(SUM(amount), 0) as total_all_time,
         COALESCE(SUM(CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY) THEN amount ELSE 0 END), 0) as last_30_days,
