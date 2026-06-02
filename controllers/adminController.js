@@ -410,15 +410,16 @@ exports.getRevenueReport = async (req, res) => {
         ${groupFormat} as period,
         COUNT(*) as transaction_count,
         COALESCE(SUM(amount), 0) as total_revenue,
-        COALESCE(SUM(CASE WHEN mpesa_receipt IS NOT NULL THEN amount ELSE 0 END), 0) as confirmed_revenue,
+        COALESCE(SUM(CASE WHEN mpesa_receipt IS NOT NULL AND mpesa_receipt != 'FAILED' THEN amount ELSE 0 END), 0) as confirmed_revenue,
         COALESCE(SUM(CASE WHEN mpesa_receipt IS NULL THEN amount ELSE 0 END), 0) as pending_revenue
       FROM payments
       WHERE created_at >= ? AND created_at <= ?
+        AND (mpesa_receipt IS NULL OR mpesa_receipt != 'FAILED')  -- Exclude failed
       GROUP BY period
       ORDER BY period DESC
     `, [start_date || '2024-01-01', end_date || '2030-12-31']);
 
-    const [[summary]] = await db.promise().query(`
+    const [summary] = await db.promise().query(`
       SELECT 
         COALESCE(SUM(amount), 0) as total_all_time,
         COALESCE(SUM(CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY) THEN amount ELSE 0 END), 0) as last_30_days,
@@ -426,7 +427,8 @@ exports.getRevenueReport = async (req, res) => {
         COALESCE(SUM(CASE WHEN DATE(created_at) = CURDATE() THEN amount ELSE 0 END), 0) as today,
         COUNT(DISTINCT user_id) as paying_customers
       FROM payments
-      WHERE mpesa_receipt IS NOT NULL
+      WHERE mpesa_receipt IS NOT NULL 
+        AND mpesa_receipt != 'FAILED'
     `);
 
     const [byPlan] = await db.promise().query(`
