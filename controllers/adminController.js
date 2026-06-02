@@ -442,7 +442,7 @@ exports.getRevenueReport = async (req, res) => {
       ORDER BY revenue DESC
     `, [start_date || '2024-01-01', end_date || '2030-12-31']);
 
-    const [[monthlyRevenue]] = await connection.query(
+    const [[monthlyRevenue]] = await db.promise().query(
       `SELECT COALESCE(SUM(amount), 0) as total 
       FROM payments 
       WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
