@@ -409,9 +409,9 @@ exports.getRevenueReport = async (req, res) => {
       SELECT 
         ${groupFormat} as period,
         COUNT(*) as transaction_count,
-        COALESCE(SUM(CASE WHEN mpesa_receipt IS NOT NULL AND mpesa_receipt != 'FAILED' THEN amount ELSE 0 END), 0) as total_revenue,
-        COALESCE(SUM(CASE WHEN mpesa_receipt IS NOT NULL AND mpesa_receipt != 'FAILED' THEN amount ELSE 0 END), 0) as confirmed_revenue,
-        COALESCE(SUM(CASE WHEN mpesa_receipt IS NULL THEN amount ELSE 0 END), 0) as pending_revenue
+        COALESCE(SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END), 0) as total_revenue,
+        COALESCE(SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END), 0) as confirmed_revenue,
+        COALESCE(SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END), 0) as pending_revenue
       FROM payments
       WHERE created_at >= ? AND created_at <= ?
       GROUP BY period
@@ -426,9 +426,8 @@ exports.getRevenueReport = async (req, res) => {
         COALESCE(SUM(CASE WHEN DATE(created_at) = CURDATE() THEN amount ELSE 0 END), 0) as today,
         COUNT(DISTINCT user_id) as paying_customers
       FROM payments
-      WHERE mpesa_receipt IS NOT NULL 
-        AND mpesa_receipt != 'FAILED'
-    `, []);
+      WHERE status = 'success'
+    `);
 
     const [byPlan] = await db.promise().query(`
       SELECT 
@@ -437,7 +436,7 @@ exports.getRevenueReport = async (req, res) => {
         COALESCE(SUM(py.amount), 0) as revenue
       FROM payments py
       LEFT JOIN plans p ON py.subscription = p.name
-      WHERE py.mpesa_receipt IS NOT NULL
+      WHERE py.status = 'success'
       AND py.created_at >= ? AND py.created_at <= ?
       GROUP BY py.subscription
       ORDER BY revenue DESC
