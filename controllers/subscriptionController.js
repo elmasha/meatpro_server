@@ -185,7 +185,7 @@ exports.initiatePayment = async (req, res) => {
             PartyA: phone,
             PartyB: shortcode,
             PhoneNumber: phone,
-            CallBackURL: `https://meatproserver-production-6328.up.railway.app/api/subscriptions/callback`,
+            CallBackURL: `https://meatproserver-production-081e.up.railway.app/api/subscriptions/callback`,
             AccountReference: `MeatPro_${userId}`,
             TransactionDesc: `MeatPro ${plan.display_name}`
           })
