@@ -72,8 +72,8 @@ exports.getStatus = async (req, res) => {
 
     // ... rest of logic ...
 
-    await redis.setEx(cacheKey, 60, JSON.stringify(response)); // Cache 1 min
-    res.json(response);
+    await redis.setEx(cacheKey, 60, JSON.stringify(rows)); // Cache 1 min
+    res.json(rows);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
