@@ -308,6 +308,11 @@ exports.createBranch = async (req, res) => {
 
     const branchId = result.insertId;
 
+    await db.promise().execute(
+      `UPDATE users SET branch_id = ? WHERE firebase_uid = ?`,
+      [branchId, firebase_uid]
+    );
+
     await invalidateBusinessCache(firebase_uid, business_id);
 
     res.status(201).json({
