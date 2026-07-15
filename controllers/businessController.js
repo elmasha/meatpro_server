@@ -285,11 +285,6 @@ exports.createBranch = async (req, res) => {
   try {
     const { business_id, name, location, firebase_uid } = req.body;
 
-    if (!business_id || !name || !firebase_uid) {
-      return res.status(400).json({ 
-        message: "business_id, name, and firebase_uid are required" 
-      });
-    }
 
     // Verify user owns this business
     const [business] = await db.promise().execute(
