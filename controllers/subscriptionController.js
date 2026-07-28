@@ -1,9 +1,33 @@
 const db = require('../config/db');
 const redis = require('../config/redis');
-
 const request = require('request');
+const moment = require('moment');
 
-// Helper: Get M-Pesa access token
+// ── SMS Helper (Onfon Media) ─────────────────────────────────────────
+function sendSMS(phone, message, callback) {
+  const payload = {
+    SenderId: process.env.ONFON_SENDER_ID,
+    IsUnicode: false,
+    IsFlash: false,
+    MessageParameters: [{ Number: phone, Text: message }],
+    ApiKey: process.env.ONFON_API_KEY,
+    ClientId: process.env.ONFON_CLIENT_ID
+  };
+
+  request.post(
+    {
+      url: process.env.ONFON_URL || 'https://api.onfonmedia.co.ke/v1/sms/SendSMS',
+      headers: { 'Content-Type': 'application/json' },
+      json: payload
+    },
+    (err, response, body) => {
+      if (err) return callback(err);
+      callback(null, body);
+    }
+  );
+}
+
+// ── M-Pesa Helper ────────────────────────────────────────────────────
 async function getMpesaToken() {
   const consumerKey = process.env.PROD_CONSUMER_KEY_DEV;
   const consumerSecret = process.env.PROD_SECRET_KEY_DEV;
@@ -25,7 +49,7 @@ async function getMpesaToken() {
   });
 }
 
-// Helper: Get user_id from firebase_uid
+// ── User Helpers ─────────────────────────────────────────────────────
 async function getUserId(firebase_uid) {
   const [rows] = await db.promise().query(
     'SELECT id FROM users WHERE firebase_uid = ?', [firebase_uid]
@@ -33,7 +57,18 @@ async function getUserId(firebase_uid) {
   return rows[0]?.id || null;
 }
 
-// GET /api/plans
+async function getUserPhone(userId) {
+  const [rows] = await db.promise().query(
+    'SELECT phone FROM users WHERE id = ? LIMIT 1', [userId]
+  );
+  return rows[0]?.phone || null;
+}
+
+function invalidateUserCache(firebase_uid) {
+  redis.del(`sub:status:${firebase_uid}`).catch(() => {});
+}
+
+// ── GET /api/plans ───────────────────────────────────────────────────
 exports.getPlans = async (req, res) => {
   try {
     const [plans] = await db.promise().query(
@@ -45,7 +80,7 @@ exports.getPlans = async (req, res) => {
   }
 };
 
-// GET /api/subscriptions/status?firebase_uid=xxx
+// ── GET /api/subscriptions/status ────────────────────────────────────
 exports.getStatus = async (req, res) => {
   try {
     const firebase_uid = req.query.firebase_uid;
@@ -58,10 +93,9 @@ exports.getStatus = async (req, res) => {
     const userId = await getUserId(firebase_uid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
-    // Single query with proper index usage
     const [rows] = await db.promise().query(`
       SELECT 
-        s.status, s.plan, s.end_date, s.plan_id,
+        s.id, s.status, s.plan, s.end_date, s.plan_id, s.start_date,
         p.display_name, p.price_kes, p.features
       FROM subscriptions s
       LEFT JOIN plans p ON s.plan_id = p.id
@@ -70,15 +104,41 @@ exports.getStatus = async (req, res) => {
       LIMIT 1
     `, [userId]);
 
-    // ... rest of logic ...
+    if (!rows.length) {
+      const response = { subscription: null, is_active: false, days_remaining: 0, message: 'No subscription found' };
+      await redis.setEx(cacheKey, 60, JSON.stringify(response));
+      return res.json(response);
+    }
 
-    await redis.setEx(cacheKey, 60, JSON.stringify(rows)); // Cache 1 min
-    res.json(rows);
+    const sub = rows[0];
+    const endDate = sub.end_date ? moment(sub.end_date) : null;
+    const daysRemaining = endDate ? endDate.diff(moment(), 'days') : 0;
+    const isActive = sub.status === 'active' && endDate && endDate.isAfter(moment());
+
+    const response = {
+      subscription: {
+        id: sub.id,
+        plan: sub.plan,
+        plan_id: sub.plan_id,
+        status: sub.status,
+        start_date: sub.start_date,
+        end_date: sub.end_date,
+        display_name: sub.display_name || sub.plan || 'Starter',
+        price_kes: parseFloat(sub.price_kes) || 0,
+        features: sub.features
+      },
+      is_active: isActive,
+      days_remaining: Math.max(0, daysRemaining)
+    };
+
+    await redis.setEx(cacheKey, 60, JSON.stringify(response));
+    res.json(response);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
-// GET /api/subscriptions/history?firebase_uid=xxx
+
+// ── GET /api/subscriptions/history ───────────────────────────────────
 exports.getPaymentHistory = async (req, res) => {
   try {
     const firebase_uid = req.query.firebase_uid;
@@ -99,7 +159,7 @@ exports.getPaymentHistory = async (req, res) => {
   }
 };
 
-// GET /api/subscriptions/latest-receipt?firebase_uid=xxx
+// ── GET /api/subscriptions/latest-receipt ────────────────────────────
 exports.getLatestReceipt = async (req, res) => {
   try {
     const firebase_uid = req.query.firebase_uid;
@@ -112,14 +172,11 @@ exports.getLatestReceipt = async (req, res) => {
       `SELECT mpesa_receipt, checkout_request_id, amount, created_at 
        FROM payments 
        WHERE user_id = ? AND mpesa_receipt IS NOT NULL AND mpesa_receipt != 'FAILED'
-       ORDER BY created_at DESC 
-       LIMIT 1`,
+       ORDER BY created_at DESC LIMIT 1`,
       [userId]
     );
 
-    if (!rows.length) {
-      return res.status(404).json({ message: 'No receipt found' });
-    }
+    if (!rows.length) return res.status(404).json({ message: 'No receipt found' });
 
     res.json({
       receipt: rows[0].mpesa_receipt,
@@ -132,11 +189,10 @@ exports.getLatestReceipt = async (req, res) => {
   }
 };
 
-// POST /api/subscriptions/initiate
+// ── POST /api/subscriptions/initiate ─────────────────────────────────
 exports.initiatePayment = async (req, res) => {
   try {
     const { firebase_uid, plan_id, phone } = req.body;
-
     if (!firebase_uid || !plan_id || !phone) {
       return res.status(400).json({ message: 'firebase_uid, plan_id, and phone required' });
     }
@@ -174,10 +230,7 @@ exports.initiatePayment = async (req, res) => {
       request.post(
         {
           url: 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json'
-          },
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             BusinessShortCode: shortcode,
             Password: password,
@@ -187,7 +240,7 @@ exports.initiatePayment = async (req, res) => {
             PartyA: phone,
             PartyB: shortcode,
             PhoneNumber: phone,
-            CallBackURL: `https://meatproserver-production-66ff.up.railway.app/api/subscriptions/callback`,
+            CallBackURL: `${process.env.BASE_URL}/api/subscriptions/callback`,
             AccountReference: `MeatPro_${userId}`,
             TransactionDesc: `MeatPro ${plan.display_name}`
           })
@@ -200,19 +253,16 @@ exports.initiatePayment = async (req, res) => {
       );
     });
 
-    console.log('STK Response:', stkResponse);
-
     if (stkResponse.CheckoutRequestID) {
       await db.promise().query(
-        `UPDATE payments 
-         SET checkout_request_id = ?
-         WHERE id = ?`,
+        `UPDATE payments SET checkout_request_id = ? WHERE id = ?`,
         [stkResponse.CheckoutRequestID, paymentResult.insertId]
       );
     }
 
     res.json({
       message: 'Payment initiated. Check your phone for M-Pesa prompt.',
+      subscription_id: subResult.insertId,        // ✅ needed by frontend demo mode
       amount: plan.price_kes,
       phone: phone,
       reference: reference,
@@ -222,19 +272,15 @@ exports.initiatePayment = async (req, res) => {
       response_description: stkResponse.ResponseDescription,
       demo_mode: true
     });
-
   } catch (error) {
     console.error('Initiate error:', error);
     res.status(500).json({ message: error.message });
   }
 };
 
-// POST /api/subscriptions/callback (M-Pesa webhook)
-// TRANSACTION: All updates wrapped in a single atomic transaction
+// ── POST /api/subscriptions/callback ─────────────────────────────────
 exports.mpesaCallback = async (req, res) => {
-  // Get a connection from the pool for transaction
   const connection = await db.promise().getConnection();
-
   try {
     await connection.beginTransaction();
 
@@ -242,113 +288,81 @@ exports.mpesaCallback = async (req, res) => {
     const result = Body.stkCallback;
     const checkoutRequestId = result.CheckoutRequestID;
 
-    console.log('Callback received for CheckoutRequestID:', checkoutRequestId);
-
     if (result.ResultCode === 0) {
       const items = result.CallbackMetadata.Item;
       const receipt = items.find(i => i.Name === 'MpesaReceiptNumber')?.Value;
       const phone = items.find(i => i.Name === 'PhoneNumber')?.Value;
-      const amount = items.find(i => i.Name === 'Amount')?.Value;
       const transactionDate = items.find(i => i.Name === 'TransactionDate')?.Value;
 
-      // STEP 1: Look up user_id from payments table using CheckoutRequestID
       const [paymentRows] = await connection.query(
         'SELECT user_id, id FROM payments WHERE checkout_request_id = ?',
         [checkoutRequestId]
       );
 
       if (!paymentRows.length) {
-        console.error('No payment found for CheckoutRequestID:', checkoutRequestId);
         await connection.rollback();
         connection.release();
         return res.json({ ResultCode: 0, ResultDesc: 'Received' });
       }
 
       const userId = paymentRows[0].user_id;
-      const paymentId = paymentRows[0].id;
 
-      console.log('Found payment:', { paymentId, userId, receipt });
-
-      // STEP 2: Update payment using BOTH checkout_request_id AND user_id
-      const [updateResult] = await connection.query(
-        `UPDATE payments 
-         SET mpesa_receipt = ?,
-             transaction_date = ?
-         WHERE checkout_request_id = ? 
-           AND user_id = ?`,
+      await connection.query(
+        `UPDATE payments SET mpesa_receipt = ?, transaction_date = ? WHERE checkout_request_id = ? AND user_id = ?`,
         [receipt, transactionDate, checkoutRequestId, userId]
       );
 
-      console.log(`Payment updated: ${updateResult.affectedRows} rows, receipt: ${receipt}`);
-
-      // STEP 3: Activate subscription
-      const [subResult] = await connection.query(
-        `UPDATE subscriptions 
-         SET status = 'active', 
-             start_date = CURDATE(), 
-             end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 
-             mpesa_receipt = ?
-         WHERE user_id = ? 
-           AND status = 'pending' 
-         ORDER BY id DESC 
-         LIMIT 1`,
+      await connection.query(
+        `UPDATE subscriptions SET status = 'active', start_date = CURDATE(), end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), mpesa_receipt = ?
+         WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1`,
         [receipt, userId]
       );
-
-      console.log(`Subscription updated: ${subResult.affectedRows} rows`);
-
-      // STEP 4: Update user - INCLUDING mpesa_receipt and payment_date
-      const [userResult] = await connection.query(
-        `UPDATE users 
-         SET subscription = 'pro', 
-             subscription_status = 'active', 
-             subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH),
-             mpesa_receipt = ?,
-             payment_date = NOW()
-         WHERE id = ?`,
-        [receipt, userId]
-      );
-
-      console.log(`User updated: ${userResult.affectedRows} rows, mpesa_receipt: ${receipt}`);
-
-      // COMMIT: All updates succeed together
-      await connection.commit();
-      console.log(`✅ TRANSACTION COMMITTED for user ${userId}, receipt: ${receipt}`);
-    } else {
-      // Payment failed - still commit the "FAILED" status
-      console.log('M-Pesa payment failed:', result.ResultDesc);
 
       await connection.query(
-        `UPDATE payments 
-         SET mpesa_receipt = 'FAILED'
-         WHERE checkout_request_id = ?`,
-        [checkoutRequestId]
+        `UPDATE users SET subscription = 'pro', subscription_status = 'active', subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH),
+         mpesa_receipt = ?, payment_date = NOW() WHERE id = ?`,
+        [receipt, userId]
       );
 
       await connection.commit();
-      console.log('Transaction committed with FAILED status');
+
+      // ✅ Send SMS after successful payment
+      const msg = `Your MeatPro Pro subscription is active! Receipt: ${receipt}. Manage your account at meatpro.app`;
+      sendSMS(phone, msg, (err, result) => {
+        if (err) console.error('SMS failed:', err);
+        else console.log('SMS sent:', result);
+      });
+
+      invalidateUserCache(userId); // you'll need firebase_uid for cache; optional
+    } else {
+      await connection.query(
+        `UPDATE payments SET mpesa_receipt = 'FAILED' WHERE checkout_request_id = ?`,
+        [checkoutRequestId]
+      );
+      await connection.commit();
     }
 
     connection.release();
     res.json({ ResultCode: 0, ResultDesc: 'Success' });
   } catch (error) {
-    // ROLLBACK: If anything fails, undo all changes
     await connection.rollback();
     connection.release();
-    console.error('Callback error - TRANSACTION ROLLED BACK:', error);
+    console.error('Callback error:', error);
     res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
   }
 };
 
-// POST /api/subscriptions/confirm (Demo/manual confirmation)
-// TRANSACTION: All updates wrapped in a single atomic transaction
+// ── POST /api/subscriptions/confirm (Demo) ───────────────────────────
 exports.confirmDemo = async (req, res) => {
   const connection = await db.promise().getConnection();
-
   try {
     await connection.beginTransaction();
 
     const { subscription_id, firebase_uid } = req.body;
+    if (!subscription_id || !firebase_uid) {
+      connection.release();
+      return res.status(400).json({ message: 'subscription_id and firebase_uid required' });
+    }
 
     const userId = await getUserId(firebase_uid);
     if (!userId) {
@@ -357,91 +371,80 @@ exports.confirmDemo = async (req, res) => {
     }
 
     const [paymentRows] = await connection.query(
-      `SELECT mpesa_receipt 
-       FROM payments 
+      `SELECT mpesa_receipt, phone FROM payments 
        WHERE user_id = ? AND mpesa_receipt IS NOT NULL AND mpesa_receipt != 'FAILED'
-       ORDER BY created_at DESC 
-       LIMIT 1`,
+       ORDER BY created_at DESC LIMIT 1`,
       [userId]
     );
 
     const realReceipt = paymentRows[0]?.mpesa_receipt || 'DEMO_RECEIPT';
+    const phone = paymentRows[0]?.phone || await getUserPhone(userId);
 
     const [subs] = await connection.query(
       'SELECT plan, plan_id FROM subscriptions WHERE id = ? AND user_id = ?',
       [subscription_id, userId]
     );
 
-    const sub = subs[0];
-    const planName = sub?.plan || 'pro';
+    const planName = subs[0]?.plan || 'pro';
 
     await connection.query(
-      `UPDATE subscriptions 
-       SET status = 'active', 
-           start_date = CURDATE(), 
-           end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 
-           mpesa_receipt = ?
+      `UPDATE subscriptions SET status = 'active', start_date = CURDATE(), end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), mpesa_receipt = ?
        WHERE id = ? AND user_id = ?`,
       [realReceipt, subscription_id, userId]
     );
 
     await connection.query(
-      `UPDATE users 
-       SET subscription = ?, 
-           subscription_status = 'active', 
-           subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH),
-           mpesa_receipt = ?,
-           payment_date = NOW()
-       WHERE id = ?`,
+      `UPDATE users SET subscription = ?, subscription_status = 'active', subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH),
+       mpesa_receipt = ?, payment_date = NOW() WHERE id = ?`,
       [planName, realReceipt, userId]
     );
 
     await connection.commit();
     connection.release();
 
-    res.json({ 
-      message: 'Subscription activated successfully',
-      receipt_used: realReceipt
-    });
+    // ✅ Send SMS after demo confirmation
+    if (phone) {
+      const msg = `Your MeatPro ${planName} subscription has been activated. Receipt: ${realReceipt}. Thank you!`;
+      sendSMS(phone, msg, (err, result) => {
+        if (err) console.error('SMS failed:', err);
+        else console.log('SMS sent:', result);
+      });
+    }
+
+    invalidateUserCache(firebase_uid);
+    res.json({ message: 'Subscription activated successfully', receipt_used: realReceipt });
   } catch (error) {
     await connection.rollback();
     connection.release();
-    console.error('confirmDemo error - TRANSACTION ROLLED BACK:', error);
+    console.error('confirmDemo error:', error);
     res.status(500).json({ message: error.message });
   }
 };
 
-// POST /api/subscriptions/cancel
+// ── POST /api/subscriptions/cancel ───────────────────────────────────
 exports.cancelSubscription = async (req, res) => {
   try {
     const { firebase_uid } = req.body;
-
     const userId = await getUserId(firebase_uid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
     await db.promise().query(
-      `UPDATE subscriptions 
-       SET status = 'cancelled'
-       WHERE user_id = ? 
-         AND status = 'active'`,
+      `UPDATE subscriptions SET status = 'cancelled' WHERE user_id = ? AND status = 'active'`,
       [userId]
     );
 
+    invalidateUserCache(firebase_uid);
     res.json({ message: 'Subscription cancelled. You can use Pro features until expiry.' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-
-// ==================== STK QUERY (Check Payment Status) ====================
+// ── POST /api/subscriptions/query ────────────────────────────────────
 exports.queryStkStatus = async (req, res) => {
   try {
     const { checkout_request_id } = req.body;
-
-    if (!checkout_request_id) {
-      return res.status(400).json({ message: 'checkout_request_id is required' });
-    }
+    if (!checkout_request_id) return res.status(400).json({ message: 'checkout_request_id is required' });
 
     const token = await getMpesaToken();
     const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
@@ -453,41 +456,27 @@ exports.queryStkStatus = async (req, res) => {
       request.post(
         {
           url: 'https://api.safaricom.co.ke/mpesa/stkpushquery/v1/query',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json'
-          },
-          json: {
-            BusinessShortCode: shortcode,
-            Password: password,
-            Timestamp: timestamp,
-            CheckoutRequestID: checkout_request_id
-          }
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          json: { BusinessShortCode: shortcode, Password: password, Timestamp: timestamp, CheckoutRequestID: checkout_request_id }
         },
         (error, response, body) => {
           if (error) return reject(error);
-          resolve({
-            statusCode: response.statusCode,
-            body: body
-          });
+          resolve({ statusCode: response.statusCode, body });
         }
       );
     });
 
     const result = queryResponse.body;
-
     res.json({
       success: true,
       status: result.ResultCode === '0' ? 'success' : 'pending',
       result_code: result.ResultCode,
       result_desc: result.ResultDesc,
-      checkout_request_id: checkout_request_id,
+      checkout_request_id,
       raw_response: result
     });
-
   } catch (error) {
     console.error('STK Query error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
-
