@@ -310,8 +310,8 @@ exports.mpesaCallback = async (req, res) => {
       const userId = paymentRows[0].user_id;
 
       await connection.query(
-        `UPDATE payments SET mpesa_receipt = ?, transaction_date = ? WHERE checkout_request_id = ? AND user_id = ?`,
-        [receipt, transactionDate, checkoutRequestId, userId]
+        `UPDATE payments SET mpesa_receipt = ?,status = ?, transaction_date = ? WHERE checkout_request_id = ? AND user_id = ?`,
+        [receipt, 'success', transactionDate, checkoutRequestId, userId]
       );
 
       await connection.query(
@@ -424,23 +424,59 @@ exports.confirmDemo = async (req, res) => {
 };
 
 // ── POST /api/subscriptions/cancel ───────────────────────────────────
+
+// POST /api/subscriptions/cancel
 exports.cancelSubscription = async (req, res) => {
   try {
     const { firebase_uid } = req.body;
+    if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
+
     const userId = await getUserId(firebase_uid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
-    await db.promise().query(
-      `UPDATE subscriptions SET status = 'cancelled' WHERE user_id = ? AND status = 'active'`,
-      [userId]
-    );
+    const connection = await db.promise().getConnection();
+    try {
+      await connection.beginTransaction();
+
+      // Cancel the active subscription (keep end_date so access continues until expiry)
+      const [subResult] = await connection.query(
+        `UPDATE subscriptions 
+         SET status = 'cancelled'
+         WHERE user_id = ? AND status = 'active'
+         ORDER BY end_date DESC LIMIT 1`,
+        [userId]
+      );
+
+      if (subResult.affectedRows === 0) {
+        await connection.rollback();
+        connection.release();
+        return res.status(400).json({ message: 'No active subscription to cancel' });
+      }
+
+      // Update users denormalized fields
+      await connection.query(
+        `UPDATE users 
+         SET subscription_status = 'cancelled'
+         WHERE id = ?`,
+        [userId]
+      );
+
+      await connection.commit();
+      connection.release();
+    } catch (err) {
+      await connection.rollback();
+      connection.release();
+      throw err;
+    }
 
     invalidateUserCache(firebase_uid);
     res.json({ message: 'Subscription cancelled. You can use Pro features until expiry.' });
   } catch (error) {
+    console.error('cancelSubscription error:', error);
     res.status(500).json({ message: error.message });
   }
 };
+
 
 // ── POST /api/subscriptions/query ────────────────────────────────────
 exports.queryStkStatus = async (req, res) => {
