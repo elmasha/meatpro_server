@@ -376,14 +376,7 @@ exports.confirmDemo = async (req, res) => {
     await connection.commit();
     connection.release();
 
-    if (phone) {
-      const msg = `Your MeatPro ${planName} subscription has been activated. Receipt: ${realReceipt}. Thank you!`;
-      sendSMS(phone, msg, (err, result) => {
-        if (err) console.error('SMS failed:', err);
-        else console.log('SMS sent:', result);
-      });
-    }
-
+  
     invalidateUserCache(firebase_uid);
     res.json({ message: 'Subscription activated successfully', receipt_used: realReceipt });
   } catch (error) {
