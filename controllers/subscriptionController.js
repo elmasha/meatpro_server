@@ -1,12 +1,10 @@
 const db = require('../config/db');
 const redis = require('../config/redis');
 const request = require('request');
+const axios = require('axios');
 const moment = require('moment');
 
 // ── SMS Helper (Onfon Media) ─────────────────────────────────────────
-const axios = require('axios');
-
-// ── SMS Helper (Onfon Media) — FIXED: uses axios instead of request ──
 function sendSMS(phone, message, callback) {
   const payload = {
     SenderId: process.env.ONFON_SENDER_ID,
@@ -26,8 +24,6 @@ function sendSMS(phone, message, callback) {
   .then(response => callback(null, response.data))
   .catch(err => callback(err));
 }
-
-
 
 // ── M-Pesa Helper ────────────────────────────────────────────────────
 async function getMpesaToken() {
@@ -136,6 +132,7 @@ exports.getStatus = async (req, res) => {
     await redis.setEx(cacheKey, 60, JSON.stringify(response));
     res.json(response);
   } catch (error) {
+    console.error('getStatus error:', error);
     res.status(500).json({ message: error.message });
   }
 };
@@ -264,7 +261,7 @@ exports.initiatePayment = async (req, res) => {
 
     res.json({
       message: 'Payment initiated. Check your phone for M-Pesa prompt.',
-      subscription_id: subResult.insertId,        // ✅ needed by frontend demo mode
+      subscription_id: subResult.insertId,
       amount: plan.price_kes,
       phone: phone,
       reference: reference,
@@ -309,10 +306,11 @@ exports.mpesaCallback = async (req, res) => {
 
       const userId = paymentRows[0].user_id;
 
-      await connection.query(
+     await connection.query(
         `UPDATE payments SET mpesa_receipt = ?,status = ?, transaction_date = ? WHERE checkout_request_id = ? AND user_id = ?`,
         [receipt, 'success', transactionDate, checkoutRequestId, userId]
       );
+
 
       await connection.query(
         `UPDATE subscriptions SET status = 'active', start_date = CURDATE(), end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), mpesa_receipt = ?
@@ -328,14 +326,13 @@ exports.mpesaCallback = async (req, res) => {
 
       await connection.commit();
 
-      // ✅ Send SMS after successful payment
       const msg = `Your MeatPro Pro subscription is active! Receipt: ${receipt}. Manage your account at meatpro.app`;
       sendSMS(phone, msg, (err, result) => {
         if (err) console.error('SMS failed:', err);
         else console.log('SMS sent:', result);
       });
 
-      invalidateUserCache(userId); // you'll need firebase_uid for cache; optional
+      invalidateUserCache(userId);
     } else {
       await connection.query(
         `UPDATE payments SET mpesa_receipt = 'FAILED' WHERE checkout_request_id = ?`,
@@ -404,7 +401,6 @@ exports.confirmDemo = async (req, res) => {
     await connection.commit();
     connection.release();
 
-    // ✅ Send SMS after demo confirmation
     if (phone) {
       const msg = `Your MeatPro ${planName} subscription has been activated. Receipt: ${realReceipt}. Thank you!`;
       sendSMS(phone, msg, (err, result) => {
@@ -424,8 +420,6 @@ exports.confirmDemo = async (req, res) => {
 };
 
 // ── POST /api/subscriptions/cancel ───────────────────────────────────
-
-// POST /api/subscriptions/cancel
 exports.cancelSubscription = async (req, res) => {
   try {
     const { firebase_uid } = req.body;
@@ -438,7 +432,6 @@ exports.cancelSubscription = async (req, res) => {
     try {
       await connection.beginTransaction();
 
-      // Cancel the active subscription (keep end_date so access continues until expiry)
       const [subResult] = await connection.query(
         `UPDATE subscriptions 
          SET status = 'cancelled'
@@ -453,7 +446,6 @@ exports.cancelSubscription = async (req, res) => {
         return res.status(400).json({ message: 'No active subscription to cancel' });
       }
 
-      // Update users denormalized fields
       await connection.query(
         `UPDATE users 
          SET subscription_status = 'cancelled'
@@ -476,7 +468,6 @@ exports.cancelSubscription = async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 };
-
 
 // ── POST /api/subscriptions/query ────────────────────────────────────
 exports.queryStkStatus = async (req, res) => {
