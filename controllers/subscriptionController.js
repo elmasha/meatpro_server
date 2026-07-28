@@ -1,29 +1,9 @@
 const db = require('../config/db');
 const redis = require('../config/redis');
 const request = require('request');
-const axios = require('axios');
 const moment = require('moment');
 
-// ── SMS Helper (Onfon Media) ─────────────────────────────────────────
-function sendSMS(phone, message, callback) {
-  const payload = {
-    SenderId: process.env.ONFON_SENDER_ID,
-    IsUnicode: false,
-    IsFlash: false,
-    MessageParameters: [{ Number: phone, Text: message }],
-    ApiKey: process.env.ONFON_API_KEY,
-    ClientId: process.env.ONFON_CLIENT_ID
-  };
 
-  const url = process.env.ONFON_URL || 'https://api.onfonmedia.co.ke/v1/sms/SendSMS';
-
-  axios.post(url, payload, {
-    headers: { 'Content-Type': 'application/json' },
-    timeout: 15000
-  })
-  .then(response => callback(null, response.data))
-  .catch(err => callback(err));
-}
 
 // ── M-Pesa Helper ────────────────────────────────────────────────────
 async function getMpesaToken() {
@@ -326,12 +306,7 @@ exports.mpesaCallback = async (req, res) => {
 
       await connection.commit();
 
-      const msg = `Your MeatPro Pro subscription is active! Receipt: ${receipt}. Manage your account at meatpro.app`;
-      sendSMS(phone, msg, (err, result) => {
-        if (err) console.error('SMS failed:', err);
-        else console.log('SMS sent:', result);
-      });
-
+  
       invalidateUserCache(userId);
     } else {
       await connection.query(
