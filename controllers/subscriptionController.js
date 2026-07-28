@@ -4,6 +4,9 @@ const request = require('request');
 const moment = require('moment');
 
 // ── SMS Helper (Onfon Media) ─────────────────────────────────────────
+const axios = require('axios');
+
+// ── SMS Helper (Onfon Media) — FIXED: uses axios instead of request ──
 function sendSMS(phone, message, callback) {
   const payload = {
     SenderId: process.env.ONFON_SENDER_ID,
@@ -14,18 +17,17 @@ function sendSMS(phone, message, callback) {
     ClientId: process.env.ONFON_CLIENT_ID
   };
 
-  request.post(
-    {
-      url: process.env.ONFON_URL || 'https://api.onfonmedia.co.ke/v1/sms/SendSMS',
-      headers: { 'Content-Type': 'application/json' },
-      json: payload
-    },
-    (err, response, body) => {
-      if (err) return callback(err);
-      callback(null, body);
-    }
-  );
+  const url = process.env.ONFON_URL || 'https://api.onfonmedia.co.ke/v1/sms/SendSMS';
+
+  axios.post(url, payload, {
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 15000
+  })
+  .then(response => callback(null, response.data))
+  .catch(err => callback(err));
 }
+
+
 
 // ── M-Pesa Helper ────────────────────────────────────────────────────
 async function getMpesaToken() {
