@@ -82,16 +82,52 @@ exports.getLastEntryReport = async (req, res) => {
 
     const [expRows] = await db.promise().execute(expQuery, expParams);
     const totalExpenses = parseFloat(expRows[0].total);
-    const netMargin = parseFloat(lastEntry.revenue) - (parseFloat(lastEntry.sold_kg) * parseFloat(lastEntry.cost_per_kg)) - totalExpenses;
+
+    // ===== REVENUE BREAKDOWN =====
+    const expectedRevenue = parseFloat(lastEntry.revenue) || 0;           // Stock math: sold_kg × selling_price
+    const paymentCash = parseFloat(lastEntry.payment_cash) || 0;          // Actual cash collected
+    const paymentMpesa = parseFloat(lastEntry.payment_mpesa) || 0;        // Actual M-Pesa collected
+    const actualRevenue = paymentCash + paymentMpesa;                     // Total payments received
+
+    // ===== COSTS =====
+    const totalCost = parseFloat(lastEntry.sold_kg) * parseFloat(lastEntry.cost_per_kg);
+
+    // ===== MARGINS =====
+    // Expected margin: what you SHOULD have made (for pricing/COG analysis)
+    const expectedMargin = expectedRevenue - totalCost - totalExpenses;
+    
+    // Actual margin: what you ACTUALLY made (real profitability)
+    const actualMargin = actualRevenue - totalCost - totalExpenses;
+    
+    // Variance: difference between expected and actual
+    const revenueVariance = expectedRevenue - actualRevenue;
 
     const result = {
       date: lastEntry.date,
-      totalRevenue: lastEntry.revenue,
-      totalCost: parseFloat(lastEntry.sold_kg) * parseFloat(lastEntry.cost_per_kg),
-      totalExpenses,
-      netMargin,
+      
+      // Revenue section
+      expectedRevenue: expectedRevenue,      // ← For COG/margin analysis
+      actualRevenue: actualRevenue,          // ← What was actually collected
+      paymentCash: paymentCash,
+      paymentMpesa: paymentMpesa,
+      revenueVariance: revenueVariance,      // ← Difference (expected - actual)
+      
+      // Costs
+      totalCost: totalCost,
+      totalExpenses: totalExpenses,
+      
+      // Margins
+      expectedMargin: expectedMargin,        // ← Theoretical margin (stock math)
+      actualMargin: actualMargin,            // ← Real margin (payments received)
+      
+      // Other metrics
       wasteKg: lastEntry.waste_kg,
-      closingStockKg: lastEntry.closing_stock_kg
+      closingStockKg: lastEntry.closing_stock_kg,
+      
+      // Selling metrics
+      soldKg: parseFloat(lastEntry.sold_kg),
+      sellingPricePerKg: parseFloat(lastEntry.selling_price_per_kg),
+      costPerKg: parseFloat(lastEntry.cost_per_kg)
     };
 
     await redis.setEx(cacheKey, 300, JSON.stringify(result));
@@ -101,7 +137,6 @@ exports.getLastEntryReport = async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 };
-
 // LAST 7 DAYS REPORT
 exports.getLast7DaysReport = async (req, res) => {
   try {
