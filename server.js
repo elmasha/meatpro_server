@@ -23,7 +23,6 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 // IMPORTANT: Handle preflight OPTIONS requests
-app.options('*', cors(corsOptions));
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
