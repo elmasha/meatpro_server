@@ -5,6 +5,7 @@ require('dotenv').config();
 // Create app
 
 
+const app = express();
 
 // Allow your frontend origins
 const corsOptions = {
