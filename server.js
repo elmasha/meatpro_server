@@ -1,13 +1,9 @@
-
 // server.js
-
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 // Create app
 
-const express = require('express');
-const cors = require('cors');
 
 const app = express();
 
