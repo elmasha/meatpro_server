@@ -5,25 +5,8 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 // Create app
-
-
 const app = express();
-
-// Allow your frontend origins
-const corsOptions = {
-  origin: [
-    'http://localhost:3000',           // Local dev
-    'https://meatproserver-production-66ff.up.railway.app'  // Production
-  ],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-};
-
-app.use(cors(corsOptions));
-
-// IMPORTANT: Handle preflight OPTIONS requests
-
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
