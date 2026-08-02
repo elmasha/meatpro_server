@@ -6,6 +6,7 @@ const calculateTotals = async (startDate, endDate, branch_id = null) => {
   let opsQuery = `
     SELECT 
       COALESCE(SUM(revenue), 0) as totalRevenue,
+      COALESCE(SUM(payment_cash + payment_mpesa), 0) as totalActualRevenue,
       COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCost,
       COALESCE(SUM(profit), 0) as totalProfit
     FROM daily_entries 
@@ -37,6 +38,7 @@ const calculateTotals = async (startDate, endDate, branch_id = null) => {
 
   return {
     totalRevenue: parseFloat(ops.totalRevenue),
+    totalActualRevenue: parseFloat(ops.totalActualRevenue),
     totalCost: parseFloat(ops.totalCost),
     totalExpenses: parseFloat(expRows[0].totalExpenses),
     totalProfit: parseFloat(ops.totalProfit)
@@ -95,35 +97,35 @@ exports.getLastEntryReport = async (req, res) => {
     // ===== MARGINS =====
     // Expected margin: what you SHOULD have made (for pricing/COG analysis)
     const expectedMargin = expectedRevenue - totalCost - totalExpenses;
-    
+
     // Actual margin: what you ACTUALLY made (real profitability)
     const actualMargin = actualRevenue - totalCost - totalExpenses;
-    
+
     // Variance: difference between expected and actual
     const revenueVariance = expectedRevenue - actualRevenue;
 
     const result = {
       date: lastEntry.date,
-      
+
       // Revenue section
       expectedRevenue: expectedRevenue,      // ← For COG/margin analysis
       actualRevenue: actualRevenue,          // ← What was actually collected
       paymentCash: paymentCash,
       paymentMpesa: paymentMpesa,
       revenueVariance: revenueVariance,      // ← Difference (expected - actual)
-      
+
       // Costs
       totalCost: totalCost,
       totalExpenses: totalExpenses,
-      
+
       // Margins
       expectedMargin: expectedMargin,        // ← Theoretical margin (stock math)
       actualMargin: actualMargin,            // ← Real margin (payments received)
-      
+
       // Other metrics
       wasteKg: lastEntry.waste_kg,
       closingStockKg: lastEntry.closing_stock_kg,
-      
+
       // Selling metrics
       soldKg: parseFloat(lastEntry.sold_kg),
       sellingPricePerKg: parseFloat(lastEntry.selling_price_per_kg),
@@ -137,6 +139,7 @@ exports.getLastEntryReport = async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 };
+
 // LAST 7 DAYS REPORT
 exports.getLast7DaysReport = async (req, res) => {
   try {
@@ -210,7 +213,7 @@ exports.getWasteAnalysis = async (req, res) => {
   try {
     const { branch_id, days = 7 } = req.query;
     const key = cacheKey('waste', branch_id, days);
-    
+
     const cached = await redis.get(key);
     if (cached) return res.json(JSON.parse(cached));
 
@@ -228,7 +231,7 @@ exports.getWasteAnalysis = async (req, res) => {
 
     const avgWastePct = rows.length ? (rows.reduce((s, r) => s + parseFloat(r.waste_pct || 0), 0) / rows.length).toFixed(2) : 0;
     const totalWasteCost = rows.reduce((s, r) => s + parseFloat(r.waste_cost || 0), 0);
-    
+
     const result = { data: rows, avgWastePct, totalWasteCost, days };
     await redis.setEx(key, 600, JSON.stringify(result));
     res.json(result);
@@ -242,7 +245,7 @@ exports.getPaymentMix = async (req, res) => {
   try {
     const { branch_id, days = 7 } = req.query;
     const key = cacheKey('payment', branch_id, days);
-    
+
     const cached = await redis.get(key);
     if (cached) return res.json(JSON.parse(cached));
 
@@ -265,7 +268,7 @@ exports.getPaymentMix = async (req, res) => {
     }), { totalCash: 0, totalMpesa: 0, totalRevenue: 0 });
 
     const avgMpesaPct = totals.totalRevenue ? ((totals.totalMpesa / totals.totalRevenue) * 100).toFixed(1) : 0;
-    
+
     const result = { data: rows, ...totals, avgMpesaPct, days };
     await redis.setEx(key, 600, JSON.stringify(result));
     res.json(result);
@@ -279,7 +282,7 @@ exports.getProfitability = async (req, res) => {
   try {
     const { branch_id, days = 7 } = req.query;
     const key = cacheKey('profit', branch_id, days);
-    
+
     const cached = await redis.get(key);
     if (cached) return res.json(JSON.parse(cached));
 
@@ -321,7 +324,7 @@ exports.getExpenseBreakdown = async (req, res) => {
   try {
     const { branch_id, days = 7 } = req.query;
     const key = cacheKey('expense', branch_id, days);
-    
+
     const cached = await redis.get(key);
     if (cached) return res.json(JSON.parse(cached));
 
