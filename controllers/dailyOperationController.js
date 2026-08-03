@@ -261,3 +261,22 @@ exports.getEntryByDate = async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 };
+
+// GET DATE TOTALS
+exports.getDateTotals = async (req, res) => {
+  try {
+    const { branch_id } = req.query;
+    const { date } = req.params;
+
+    if (!date || !branch_id) {
+      return res.status(400).json({ message: "Date and branch_id are required" });
+    }
+
+    const totals = await calculateDateTotals(date, branch_id);
+
+    res.status(200).json(totals);
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
