@@ -15,6 +15,50 @@ const invalidateDailyCache = async (branch_id, date) => {
   }
 };
 
+// ===== SINGLE DATE TOTALS HELPER =====
+const calculateDateTotals = async (date, branch_id = null) => {
+  let opsQuery = `
+    SELECT 
+      COALESCE(SUM(revenue), 0) as totalRevenue,
+      COALESCE(SUM(payment_cash + payment_mpesa), 0) as totalActualRevenue,
+      COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCost,
+      COALESCE(SUM(profit), 0) as totalProfit
+    FROM daily_entries 
+    WHERE date = ?
+  `;
+  const opsParams = [date];
+
+  if (branch_id) {
+    opsQuery += ` AND branch_id = ?`;
+    opsParams.push(branch_id);
+  }
+
+  const [opsRows] = await db.promise().execute(opsQuery, opsParams);
+  const ops = opsRows[0];
+
+  let expQuery = `
+    SELECT COALESCE(SUM(amount), 0) as totalExpenses 
+    FROM expenses 
+    WHERE date = ?
+  `;
+  const expParams = [date];
+
+  if (branch_id) {
+    expQuery += ` AND branch_id = ?`;
+    expParams.push(branch_id);
+  }
+
+  const [expRows] = await db.promise().execute(expQuery, expParams);
+
+  return {
+    totalRevenue: parseFloat(ops.totalRevenue),
+    totalActualRevenue: parseFloat(ops.totalActualRevenue),
+    totalCost: parseFloat(ops.totalCost),
+    totalExpenses: parseFloat(expRows[0].totalExpenses),
+    totalProfit: parseFloat(ops.totalProfit)
+  };
+};
+
 // CREATE OR UPDATE DAILY ENTRY
 exports.createOrUpdateDailyOperation = async (req, res) => {
   try {
