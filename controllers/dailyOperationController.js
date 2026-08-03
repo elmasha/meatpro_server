@@ -178,3 +178,73 @@ exports.getLastEntry = async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 };
+
+// GET ENTRY BY DATE
+exports.getEntryByDate = async (req, res) => {
+  try {
+    const { branch_id } = req.query;
+    const { date } = req.params;
+
+    if (!date || !branch_id) {
+      return res.status(400).json({ message: "Date and branch_id are required" });
+    }
+
+    const query = `SELECT * FROM daily_entries WHERE date = ? AND branch_id = ?`;
+    const [rows] = await db.promise().execute(query, [date, branch_id]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: "No entry found for this date" });
+    }
+
+    const entry = rows[0];
+
+    // ===== CALCULATE ACTUAL REVENUE & PROFIT =====
+    const expectedRevenue = parseFloat(entry.revenue) || 0;
+    const paymentCash = parseFloat(entry.payment_cash) || 0;
+    const paymentMpesa = parseFloat(entry.payment_mpesa) || 0;
+    const actualRevenue = paymentCash + paymentMpesa;
+    const cogs = (parseFloat(entry.sold_kg) || 0) * (parseFloat(entry.cost_per_kg) || 0);
+
+    // Fetch actual expenses for this date from expenses table
+    let totalExpenses = 0;
+    try {
+      const [expRows] = await db.promise().execute(
+        `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date = ? AND branch_id = ?`,
+        [date, branch_id]
+      );
+      totalExpenses = parseFloat(expRows[0].total) || 0;
+    } catch (e) {
+      totalExpenses = 0;
+    }
+
+    const actualProfit = actualRevenue - cogs - totalExpenses;
+    const expectedProfit = expectedRevenue - cogs - totalExpenses;
+    const revenueVariance = expectedRevenue - actualRevenue;
+    const marginPct = actualRevenue > 0 ? ((actualProfit / actualRevenue) * 100).toFixed(1) : 0;
+
+    const result = {
+      ...entry,
+      // Actual (real money)
+      actualRevenue,
+      actualProfit,
+      marginPct: parseFloat(marginPct),
+      // Expected (stock math)
+      expectedRevenue,
+      expectedProfit,
+      // Breakdown
+      revenueVariance,
+      paymentCash,
+      paymentMpesa,
+      cogs,
+      totalExpenses,
+      // Backward compat
+      totalRevenue: actualRevenue,
+      netMargin: actualProfit,
+    };
+
+    res.status(200).json(result);
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
