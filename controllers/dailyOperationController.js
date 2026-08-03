@@ -45,10 +45,23 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
     const mpesa = parseFloat(payment_mpesa) || 0;
 
     const sold_kg = opening + supply - waste - closing;
-    const revenue = sold_kg * sellPrice;
-    const total_cost = sold_kg * cost;
-    const expenses = cash + mpesa;
-    const profit = revenue - total_cost - expenses;
+    const revenue = sold_kg * sellPrice;           // Expected revenue (stock math)
+    const total_cost = sold_kg * cost;             // COGS
+    const actual_revenue = cash + mpesa;           // Actual money received
+
+    // Fetch actual expenses from expenses table for this date
+    let actual_expenses = 0;
+    try {
+      const [expRows] = await db.promise().execute(
+        `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date = ? AND branch_id = ?`,
+        [date, branch_id]
+      );
+      actual_expenses = parseFloat(expRows[0].total) || 0;
+    } catch (e) {
+      actual_expenses = 0;
+    }
+
+    const profit = actual_revenue - total_cost - actual_expenses;  // Real profit
 
     if (sold_kg < 0) {
       return res.status(400).json({ 
@@ -81,7 +94,7 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
     await db.promise().execute(query, [
       branch_id, date, opening, supply, waste, sold_kg,
       closing, cost, sellPrice, revenue,
-      expenses, profit, cash, mpesa
+      actual_expenses, profit, cash, mpesa
     ]);
 
     // Invalidate cached reports since data changed
