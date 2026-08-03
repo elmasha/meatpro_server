@@ -1,16 +1,14 @@
 const db = require("../config/db");
 const redis = require('../config/redis');
 
-// ===== HELPERS =====
+// ===== EXISTING HELPERS (keep as-is) =====
 const calculateTotals = async (startDate, endDate, branch_id = null) => {
   let opsQuery = `
     SELECT 
       COALESCE(SUM(revenue), 0) as totalRevenue,
       COALESCE(SUM(payment_cash + payment_mpesa), 0) as totalActualRevenue,
       COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCost,
-      COALESCE(SUM(profit), 0) as totalProfit,
-      COALESCE(SUM(sold_kg), 0) as totalSold,
-      COALESCE(AVG(waste_kg), 0) as avgWaste
+      COALESCE(SUM(profit), 0) as totalProfit
     FROM daily_entries 
     WHERE date BETWEEN ? AND ?
   `;
@@ -39,25 +37,23 @@ const calculateTotals = async (startDate, endDate, branch_id = null) => {
   const [expRows] = await db.promise().execute(expQuery, expParams);
 
   return {
-    totalRevenue: parseFloat(ops.totalRevenue) || 0,
-    totalActualRevenue: parseFloat(ops.totalActualRevenue) || 0,
-    totalCost: parseFloat(ops.totalCost) || 0,
-    totalExpenses: parseFloat(expRows[0].totalExpenses) || 0,
-    totalProfit: parseFloat(ops.totalProfit) || 0,
-    totalSold: parseFloat(ops.totalSold) || 0,
-    avgWaste: parseFloat(ops.avgWaste) || 0
+    totalRevenue: parseFloat(ops.totalRevenue),
+    totalActualRevenue: parseFloat(ops.totalActualRevenue),
+    totalCost: parseFloat(ops.totalCost),
+    totalExpenses: parseFloat(expRows[0].totalExpenses),
+    totalProfit: parseFloat(ops.totalProfit)
   };
 };
 
-const cacheKey = (prefix, branch_id, params = '') => `report:${prefix}:${branch_id || 'all'}:${params}`;
+// ===== EXISTING ENDPOINTS (keep as-is) =====
 
-// ===== LAST ENTRY REPORT =====
+// LAST ENTRY REPORT
 exports.getLastEntryReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
-    const cacheKeyStr = `report:last-entry:${branch_id || 'all'}`;
+    const cacheKey = `report:last-entry:${branch_id || 'all'}`;
 
-    const cached = await redis.get(cacheKeyStr);
+    const cached = await redis.get(cacheKey);
     if (cached) {
       return res.status(200).json(JSON.parse(cached));
     }
@@ -87,36 +83,56 @@ exports.getLastEntryReport = async (req, res) => {
     }
 
     const [expRows] = await db.promise().execute(expQuery, expParams);
-    const totalExpenses = parseFloat(expRows[0].total) || 0;
+    const totalExpenses = parseFloat(expRows[0].total);
 
-    const expectedRevenue = parseFloat(lastEntry.revenue) || 0;
-    const paymentCash = parseFloat(lastEntry.payment_cash) || 0;
-    const paymentMpesa = parseFloat(lastEntry.payment_mpesa) || 0;
-    const actualRevenue = paymentCash + paymentMpesa;
+    // ===== REVENUE BREAKDOWN =====
+    const expectedRevenue = parseFloat(lastEntry.revenue) || 0;           // Stock math: sold_kg × selling_price
+    const paymentCash = parseFloat(lastEntry.payment_cash) || 0;          // Actual cash collected
+    const paymentMpesa = parseFloat(lastEntry.payment_mpesa) || 0;        // Actual M-Pesa collected
+    const actualRevenue = paymentCash + paymentMpesa;                     // Total payments received
+
+    // ===== COSTS =====
     const totalCost = parseFloat(lastEntry.sold_kg) * parseFloat(lastEntry.cost_per_kg);
+
+    // ===== MARGINS =====
+    // Expected margin: what you SHOULD have made (for pricing/COG analysis)
     const expectedMargin = expectedRevenue - totalCost - totalExpenses;
+
+    // Actual margin: what you ACTUALLY made (real profitability)
     const actualMargin = actualRevenue - totalCost - totalExpenses;
+
+    // Variance: difference between expected and actual
     const revenueVariance = expectedRevenue - actualRevenue;
 
     const result = {
       date: lastEntry.date,
-      expectedRevenue,
-      actualRevenue,
-      paymentCash,
-      paymentMpesa,
-      revenueVariance,
-      totalCost,
-      totalExpenses,
-      expectedMargin,
-      actualMargin,
+
+      // Revenue section
+      expectedRevenue: expectedRevenue,      // ← For COG/margin analysis
+      actualRevenue: actualRevenue,          // ← What was actually collected
+      paymentCash: paymentCash,
+      paymentMpesa: paymentMpesa,
+      revenueVariance: revenueVariance,      // ← Difference (expected - actual)
+
+      // Costs
+      totalCost: totalCost,
+      totalExpenses: totalExpenses,
+
+      // Margins
+      expectedMargin: expectedMargin,        // ← Theoretical margin (stock math)
+      actualMargin: actualMargin,            // ← Real margin (payments received)
+
+      // Other metrics
       wasteKg: lastEntry.waste_kg,
       closingStockKg: lastEntry.closing_stock_kg,
+
+      // Selling metrics
       soldKg: parseFloat(lastEntry.sold_kg),
       sellingPricePerKg: parseFloat(lastEntry.selling_price_per_kg),
       costPerKg: parseFloat(lastEntry.cost_per_kg)
     };
 
-    await redis.setEx(cacheKeyStr, 300, JSON.stringify(result));
+    await redis.setEx(cacheKey, 300, JSON.stringify(result));
     res.status(200).json(result);
 
   } catch (error) {
@@ -128,9 +144,9 @@ exports.getLastEntryReport = async (req, res) => {
 exports.getLast7DaysReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
-    const cacheKeyStr = `report:last-7-days:${branch_id || 'all'}`;
+    const cacheKey = `report:last-7-days:${branch_id || 'all'}`;
 
-    const cached = await redis.get(cacheKeyStr);
+    const cached = await redis.get(cacheKey);
     if (cached) {
       return res.status(200).json(JSON.parse(cached));
     }
@@ -147,7 +163,7 @@ exports.getLast7DaysReport = async (req, res) => {
       ...totals
     };
 
-    await redis.setEx(cacheKeyStr, 900, JSON.stringify(result));
+    await redis.setEx(cacheKey, 900, JSON.stringify(result));
     res.status(200).json(result);
 
   } catch (error) {
@@ -159,9 +175,9 @@ exports.getLast7DaysReport = async (req, res) => {
 exports.getMonthToDateReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
-    const cacheKeyStr = `report:month-to-date:${branch_id || 'all'}`;
+    const cacheKey = `report:month-to-date:${branch_id || 'all'}`;
 
-    const cached = await redis.get(cacheKeyStr);
+    const cached = await redis.get(cacheKey);
     if (cached) {
       return res.status(200).json(JSON.parse(cached));
     }
@@ -179,7 +195,7 @@ exports.getMonthToDateReport = async (req, res) => {
       ...totals
     };
 
-    await redis.setEx(cacheKeyStr, 900, JSON.stringify(result));
+    await redis.setEx(cacheKey, 900, JSON.stringify(result));
     res.status(200).json(result);
 
   } catch (error) {
@@ -187,7 +203,12 @@ exports.getMonthToDateReport = async (req, res) => {
   }
 };
 
-// ===== WASTE ANALYSIS =====
+// ===== NEW ANALYTICS ENDPOINTS =====
+
+// Cache helper
+const cacheKey = (prefix, branch_id, params = '') => `report:${prefix}:${branch_id || 'all'}:${params}`;
+
+// WASTE ANALYSIS
 exports.getWasteAnalysis = async (req, res) => {
   try {
     const { branch_id, days = 7 } = req.query;
@@ -219,7 +240,7 @@ exports.getWasteAnalysis = async (req, res) => {
   }
 };
 
-// ===== PAYMENT MIX =====
+// PAYMENT MIX
 exports.getPaymentMix = async (req, res) => {
   try {
     const { branch_id, days = 7 } = req.query;
@@ -233,31 +254,22 @@ exports.getPaymentMix = async (req, res) => {
         date,
         payment_cash,
         payment_mpesa,
-        (payment_cash + payment_mpesa) as actual_revenue,
-        revenue as expected_revenue,
-        (payment_mpesa / NULLIF(payment_cash + payment_mpesa, 0)) * 100 as mpesa_pct
+        revenue,
+        (payment_mpesa / NULLIF(revenue, 0)) * 100 as mpesa_pct
       FROM daily_entries 
-      WHERE branch_id = ? AND date >= DATE_SUB(CURDATE(), INTERVAL ? DAY) AND (payment_cash + payment_mpesa) > 0
+      WHERE branch_id = ? AND date >= DATE_SUB(CURDATE(), INTERVAL ? DAY) AND revenue > 0
       ORDER BY date DESC
     `, [branch_id || 1, parseInt(days)]);
 
     const totals = rows.reduce((acc, r) => ({
       totalCash: acc.totalCash + parseFloat(r.payment_cash || 0),
       totalMpesa: acc.totalMpesa + parseFloat(r.payment_mpesa || 0),
-      totalActualRevenue: acc.totalActualRevenue + parseFloat(r.actual_revenue || 0),
-      totalExpectedRevenue: acc.totalExpectedRevenue + parseFloat(r.expected_revenue || 0)
-    }), { totalCash: 0, totalMpesa: 0, totalActualRevenue: 0, totalExpectedRevenue: 0 });
+      totalRevenue: acc.totalRevenue + parseFloat(r.revenue || 0)
+    }), { totalCash: 0, totalMpesa: 0, totalRevenue: 0 });
 
-    const avgMpesaPct = totals.totalActualRevenue ? ((totals.totalMpesa / totals.totalActualRevenue) * 100).toFixed(1) : 0;
-    const revenueVariance = totals.totalExpectedRevenue - totals.totalActualRevenue;
+    const avgMpesaPct = totals.totalRevenue ? ((totals.totalMpesa / totals.totalRevenue) * 100).toFixed(1) : 0;
 
-    const result = { 
-      data: rows, 
-      ...totals, 
-      avgMpesaPct, 
-      revenueVariance,
-      days 
-    };
+    const result = { data: rows, ...totals, avgMpesaPct, days };
     await redis.setEx(key, 600, JSON.stringify(result));
     res.json(result);
   } catch (error) {
@@ -265,7 +277,7 @@ exports.getPaymentMix = async (req, res) => {
   }
 };
 
-// ===== PROFITABILITY TREND =====
+// PROFITABILITY TREND
 exports.getProfitability = async (req, res) => {
   try {
     const { branch_id, days = 7 } = req.query;
@@ -274,63 +286,23 @@ exports.getProfitability = async (req, res) => {
     const cached = await redis.get(key);
     if (cached) return res.json(JSON.parse(cached));
 
-    // First, get daily entries with expenses joined
     const [daily] = await db.promise().execute(`
       SELECT 
-        de.date,
-        de.revenue as expected_revenue,
-        (de.payment_cash + de.payment_mpesa) as actual_revenue,
-        de.profit as expected_profit,
-        de.sold_kg,
-        de.cost_per_kg,
-        de.payment_cash,
-        de.payment_mpesa,
-        COALESCE(e.total_expenses, 0) as daily_expenses
-      FROM daily_entries de
-      LEFT JOIN (
-        SELECT date, SUM(amount) as total_expenses 
-        FROM expenses 
-        WHERE branch_id = ? 
-        GROUP BY date
-      ) e ON de.date = e.date
-      WHERE de.branch_id = ? AND de.date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-      ORDER BY de.date
-    `, [branch_id || 1, branch_id || 1, parseInt(days)]);
+        date,
+        revenue,
+        profit,
+        (profit / NULLIF(revenue, 0)) * 100 as margin_pct,
+        sold_kg
+      FROM daily_entries 
+      WHERE branch_id = ? AND date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+      ORDER BY date
+    `, [branch_id || 1, parseInt(days)]);
 
-    // Calculate actual profit with expenses
-    const dailyWithActual = daily.map(d => {
-      const actualRevenue = parseFloat(d.actual_revenue) || 0;
-      const cogs = parseFloat(d.sold_kg || 0) * parseFloat(d.cost_per_kg || 0);
-      const expenses = parseFloat(d.daily_expenses) || 0;
-      const actualProfit = actualRevenue - cogs - expenses;
-      const expectedProfit = parseFloat(d.expected_profit) || 0;
-      const actualMarginPct = actualRevenue ? ((actualProfit / actualRevenue) * 100) : 0;
-      const expectedMarginPct = d.expected_revenue ? ((expectedProfit / d.expected_revenue) * 100) : 0;
-
-      return {
-        date: d.date,
-        expected_revenue: parseFloat(d.expected_revenue) || 0,
-        actual_revenue: actualRevenue,
-        expected_profit: expectedProfit,
-        actual_profit: actualProfit,
-        expected_margin_pct: expectedMarginPct.toFixed(1),
-        actual_margin_pct: actualMarginPct.toFixed(1),
-        sold_kg: parseFloat(d.sold_kg) || 0,
-        payment_cash: parseFloat(d.payment_cash) || 0,
-        payment_mpesa: parseFloat(d.payment_mpesa) || 0,
-        cogs: cogs,
-        expenses: expenses
-      };
-    });
-
-    // Day of week analysis
     const [dow] = await db.promise().execute(`
       SELECT 
         DAYNAME(date) as day_name,
-        AVG(payment_cash + payment_mpesa) as avg_actual_revenue,
-        AVG(revenue) as avg_expected_revenue,
-        AVG(payment_cash + payment_mpesa - (sold_kg * cost_per_kg)) as avg_actual_profit,
-        AVG(profit) as avg_expected_profit,
+        AVG(revenue) as avg_revenue,
+        AVG(profit) as avg_profit,
         AVG(sold_kg) as avg_sold,
         COUNT(*) as entry_count
       FROM daily_entries 
@@ -339,7 +311,7 @@ exports.getProfitability = async (req, res) => {
       ORDER BY DAYOFWEEK(date)
     `, [branch_id || 1, parseInt(days)]);
 
-    const result = { daily: dailyWithActual, dayOfWeek: dow, days };
+    const result = { daily, dayOfWeek: dow, days };
     await redis.setEx(key, 600, JSON.stringify(result));
     res.json(result);
   } catch (error) {
@@ -347,7 +319,7 @@ exports.getProfitability = async (req, res) => {
   }
 };
 
-// ===== EXPENSE BREAKDOWN =====
+// EXPENSE BREAKDOWN
 exports.getExpenseBreakdown = async (req, res) => {
   try {
     const { branch_id, days = 7 } = req.query;
@@ -382,7 +354,7 @@ exports.getExpenseBreakdown = async (req, res) => {
   }
 };
 
-// ===== COMPARATIVE (This Month vs Last Month) =====
+// COMPARATIVE (This Month vs Last Month)
 exports.getComparative = async (req, res) => {
   try {
     const { branch_id } = req.query;
@@ -391,13 +363,10 @@ exports.getComparative = async (req, res) => {
     const cached = await redis.get(key);
     if (cached) return res.json(JSON.parse(cached));
 
-    // This month
     const [thisMonth] = await db.promise().execute(`
       SELECT 
-        COALESCE(SUM(revenue), 0) as expected_revenue,
-        COALESCE(SUM(payment_cash + payment_mpesa), 0) as actual_revenue,
-        COALESCE(SUM(profit), 0) as expected_profit,
-        COALESCE(SUM(payment_cash + payment_mpesa - (sold_kg * cost_per_kg)), 0) as raw_actual_profit,
+        COALESCE(SUM(revenue), 0) as revenue, 
+        COALESCE(SUM(profit), 0) as profit, 
         COALESCE(SUM(sold_kg), 0) as sold, 
         COALESCE(AVG(waste_kg), 0) as avg_waste
       FROM daily_entries 
@@ -406,13 +375,10 @@ exports.getComparative = async (req, res) => {
         AND MONTH(date) = MONTH(CURDATE())
     `, [branch_id || 1]);
 
-    // Last month
     const [lastMonth] = await db.promise().execute(`
       SELECT 
-        COALESCE(SUM(revenue), 0) as expected_revenue,
-        COALESCE(SUM(payment_cash + payment_mpesa), 0) as actual_revenue,
-        COALESCE(SUM(profit), 0) as expected_profit,
-        COALESCE(SUM(payment_cash + payment_mpesa - (sold_kg * cost_per_kg)), 0) as raw_actual_profit,
+        COALESCE(SUM(revenue), 0) as revenue, 
+        COALESCE(SUM(profit), 0) as profit, 
         COALESCE(SUM(sold_kg), 0) as sold, 
         COALESCE(AVG(waste_kg), 0) as avg_waste
       FROM daily_entries 
@@ -421,66 +387,18 @@ exports.getComparative = async (req, res) => {
         AND MONTH(date) = MONTH(CURDATE() - INTERVAL 1 MONTH)
     `, [branch_id || 1]);
 
-    // Expenses for both months
-    const [thisMonthExp] = await db.promise().execute(`
-      SELECT COALESCE(SUM(amount), 0) as total_expenses
-      FROM expenses
-      WHERE branch_id = ? 
-        AND YEAR(date) = YEAR(CURDATE()) 
-        AND MONTH(date) = MONTH(CURDATE())
-    `, [branch_id || 1]);
-
-    const [lastMonthExp] = await db.promise().execute(`
-      SELECT COALESCE(SUM(amount), 0) as total_expenses
-      FROM expenses
-      WHERE branch_id = ? 
-        AND YEAR(date) = YEAR(CURDATE() - INTERVAL 1 MONTH) 
-        AND MONTH(date) = MONTH(CURDATE() - INTERVAL 1 MONTH)
-    `, [branch_id || 1]);
-
-    const thisMonthExpenses = parseFloat(thisMonthExp[0].total_expenses) || 0;
-    const lastMonthExpenses = parseFloat(lastMonthExp[0].total_expenses) || 0;
-
-    const calcChange = (curr, prev) => {
-      const c = parseFloat(curr) || 0;
-      const p = parseFloat(prev) || 0;
-      return p ? (((c - p) / p) * 100).toFixed(1) : 0;
-    };
-
-    const thisRawProfit = parseFloat(thisMonth[0].raw_actual_profit) || 0;
-    const lastRawProfit = parseFloat(lastMonth[0].raw_actual_profit) || 0;
-    const thisActualProfit = thisRawProfit - thisMonthExpenses;
-    const lastActualProfit = lastRawProfit - lastMonthExpenses;
+    const calcChange = (curr, prev) => prev ? (((curr - prev) / prev) * 100).toFixed(1) : 0;
 
     const result = {
-      thisMonth: {
-        expected_revenue: parseFloat(thisMonth[0].expected_revenue) || 0,
-        actual_revenue: parseFloat(thisMonth[0].actual_revenue) || 0,
-        expected_profit: parseFloat(thisMonth[0].expected_profit) || 0,
-        actual_profit: thisActualProfit,
-        sold: parseFloat(thisMonth[0].sold) || 0,
-        avg_waste: parseFloat(thisMonth[0].avg_waste) || 0,
-        expenses: thisMonthExpenses
-      },
-      lastMonth: {
-        expected_revenue: parseFloat(lastMonth[0].expected_revenue) || 0,
-        actual_revenue: parseFloat(lastMonth[0].actual_revenue) || 0,
-        expected_profit: parseFloat(lastMonth[0].expected_profit) || 0,
-        actual_profit: lastActualProfit,
-        sold: parseFloat(lastMonth[0].sold) || 0,
-        avg_waste: parseFloat(lastMonth[0].avg_waste) || 0,
-        expenses: lastMonthExpenses
-      },
+      thisMonth: thisMonth[0],
+      lastMonth: lastMonth[0],
       changes: {
-        expected_revenue: calcChange(thisMonth[0].expected_revenue, lastMonth[0].expected_revenue),
-        actual_revenue: calcChange(thisMonth[0].actual_revenue, lastMonth[0].actual_revenue),
-        expected_profit: calcChange(thisMonth[0].expected_profit, lastMonth[0].expected_profit),
-        actual_profit: calcChange(thisActualProfit, lastActualProfit),
-        sold: calcChange(thisMonth[0].sold, lastMonth[0].sold),
-        waste: calcChange(thisMonth[0].avg_waste, lastMonth[0].avg_waste)
+        revenue: calcChange(parseFloat(thisMonth[0].revenue), parseFloat(lastMonth[0].revenue)),
+        profit: calcChange(parseFloat(thisMonth[0].profit), parseFloat(lastMonth[0].profit)),
+        sold: calcChange(parseFloat(thisMonth[0].sold), parseFloat(lastMonth[0].sold)),
+        waste: calcChange(parseFloat(thisMonth[0].avg_waste), parseFloat(lastMonth[0].avg_waste))
       }
     };
-
     await redis.setEx(key, 900, JSON.stringify(result));
     res.json(result);
   } catch (error) {
