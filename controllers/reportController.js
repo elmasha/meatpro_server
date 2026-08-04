@@ -1,14 +1,23 @@
 const db = require("../config/db");
 const redis = require('../config/redis');
 
-// ===== EXISTING HELPERS (keep as-is) =====
+// ===== FORMATTER =====
+const fmt = (n) => {
+  const v = parseFloat(n);
+  return isNaN(v) ? 0 : Math.round(v * 100) / 100;
+};
+
+// Cache helper
+const cacheKey = (prefix, branch_id, params = '') => `report:${prefix}:${branch_id || 'all'}:${params}`;
+
+// ===== CORRECTED calculateTotals =====
 const calculateTotals = async (startDate, endDate, branch_id = null) => {
   let opsQuery = `
     SELECT 
       COALESCE(SUM(revenue), 0) as totalRevenue,
       COALESCE(SUM(payment_cash + payment_mpesa), 0) as totalActualRevenue,
       COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCost,
-      COALESCE(SUM(profit), 0) as totalProfit
+      COALESCE(SUM(sold_kg), 0) as totalSoldKg
     FROM daily_entries 
     WHERE date BETWEEN ? AND ?
   `;
@@ -36,27 +45,30 @@ const calculateTotals = async (startDate, endDate, branch_id = null) => {
 
   const [expRows] = await db.promise().execute(expQuery, expParams);
 
+  const totalRevenue = parseFloat(ops.totalRevenue);
+  const totalActualRevenue = parseFloat(ops.totalActualRevenue);
+  const totalCost = parseFloat(ops.totalCost);
+  const totalExpenses = parseFloat(expRows[0].totalExpenses);
+
+  // CORRECTED: Calculate actual profit from real numbers
+  const totalActualProfit = totalActualRevenue - totalCost - totalExpenses;
+  const totalExpectedProfit = totalRevenue - totalCost - totalExpenses;
+
   return {
-    totalRevenue: parseFloat(ops.totalRevenue),
-    totalActualRevenue: parseFloat(ops.totalActualRevenue),
-    totalCost: parseFloat(ops.totalCost),
-    totalExpenses: parseFloat(expRows[0].totalExpenses),
-    totalProfit: parseFloat(ops.totalProfit)
+    totalRevenue: fmt(totalRevenue),              // Expected (stock math)
+    totalActualRevenue: fmt(totalActualRevenue),  // Cash + Mpesa (real money)
+    totalCost: fmt(totalCost),                      // COGS
+    totalExpenses: fmt(totalExpenses),             // Real expenses from expenses table
+    totalProfit: fmt(totalActualProfit),            // CORRECTED: Actual profit
+    totalExpectedProfit: fmt(totalExpectedProfit),  // Expected profit
+    totalSoldKg: fmt(ops.totalSoldKg),
+    revenueVariance: fmt(totalRevenue - totalActualRevenue)  // Expected - Actual
   };
 };
 
-// ===== FORMATTER =====
-const fmt = (n) => {
-  const v = parseFloat(n);
-  return isNaN(v) ? 0 : Math.round(v * 100) / 100;
-};
+// ===== EXISTING ENDPOINTS (CORRECTED) =====
 
-// Cache helper
-const cacheKey = (prefix, branch_id, params = '') => `report:${prefix}:${branch_id || 'all'}:${params}`;
-
-// ===== EXISTING ENDPOINTS (UPDATED WITH ACTUAL/EXPECTED) =====
-
-// LAST ENTRY REPORT — KEEP EXACTLY AS-IS (already working)
+// LAST ENTRY REPORT
 exports.getLastEntryReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
@@ -99,8 +111,10 @@ exports.getLastEntryReport = async (req, res) => {
     const paymentMpesa = parseFloat(lastEntry.payment_mpesa) || 0;
     const actualRevenue = paymentCash + paymentMpesa;
     const totalCost = parseFloat(lastEntry.sold_kg) * parseFloat(lastEntry.cost_per_kg);
-    const expectedMargin = expectedRevenue - totalCost - totalExpenses;
-    const actualMargin = actualRevenue - totalCost - totalExpenses;
+
+    // CORRECTED profit calculations
+    const expectedProfit = expectedRevenue - totalCost - totalExpenses;
+    const actualProfit = actualRevenue - totalCost - totalExpenses;
     const revenueVariance = expectedRevenue - actualRevenue;
 
     const result = {
@@ -112,8 +126,10 @@ exports.getLastEntryReport = async (req, res) => {
       revenueVariance: fmt(revenueVariance),
       totalCost: fmt(totalCost),
       totalExpenses: fmt(totalExpenses),
-      expectedMargin: fmt(expectedMargin),
-      actualMargin: fmt(actualMargin),
+      expectedProfit: fmt(expectedProfit),
+      actualProfit: fmt(actualProfit),
+      expectedMarginPct: expectedRevenue > 0 ? fmt((expectedProfit / expectedRevenue) * 100) : 0,
+      actualMarginPct: actualRevenue > 0 ? fmt((actualProfit / actualRevenue) * 100) : 0,
       wasteKg: lastEntry.waste_kg,
       closingStockKg: lastEntry.closing_stock_kg,
       soldKg: fmt(lastEntry.sold_kg),
@@ -191,8 +207,6 @@ exports.getMonthToDateReport = async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 };
-
-// ===== NEW / UPDATED ANALYTICS ENDPOINTS =====
 
 // WASTE ANALYSIS
 exports.getWasteAnalysis = async (req, res) => {
@@ -301,7 +315,7 @@ exports.getPaymentMix = async (req, res) => {
   }
 };
 
-// PROFITABILITY TREND
+// PROFITABILITY TREND — CORRECTED
 exports.getProfitability = async (req, res) => {
   try {
     const { branch_id, days = 7 } = req.query;
@@ -315,7 +329,6 @@ exports.getProfitability = async (req, res) => {
         de.date,
         COALESCE(de.revenue, 0) as expected_revenue,
         COALESCE(de.payment_cash + de.payment_mpesa, 0) as actual_revenue,
-        COALESCE(de.profit, 0) as expected_profit,
         COALESCE(de.sold_kg * de.cost_per_kg, 0) as total_cost,
         COALESCE(de.sold_kg, 0) as sold_kg,
         COALESCE(de.waste_kg, 0) as waste_kg,
@@ -337,7 +350,7 @@ exports.getProfitability = async (req, res) => {
       const dailyExpenses = parseFloat(r.daily_expenses) || 0;
       const actualProfit = actualRevenue - totalCost - dailyExpenses;
       const expectedRevenue = parseFloat(r.expected_revenue) || 0;
-      const expectedProfit = parseFloat(r.expected_profit) || 0;
+      const expectedProfit = expectedRevenue - totalCost - dailyExpenses;
 
       return {
         date: r.date,
@@ -351,29 +364,49 @@ exports.getProfitability = async (req, res) => {
         actual_margin_pct: actualRevenue > 0 ? fmt((actualProfit / actualRevenue) * 100) : 0,
         sold_kg: fmt(r.sold_kg),
         waste_kg: fmt(r.waste_kg),
-        // backward compat
-        revenue: fmt(expectedRevenue),
-        profit: fmt(expectedProfit),
-        margin_pct: expectedRevenue > 0 ? fmt((expectedProfit / expectedRevenue) * 100) : 0,
       };
     });
 
+    // CORRECTED: Day of week using actual profit
     const [dow] = await db.promise().execute(`
       SELECT 
-        DAYNAME(date) as day_name,
-        AVG(revenue) as avg_revenue,
-        AVG(payment_cash + payment_mpesa) as avg_actual_revenue,
-        AVG(profit) as avg_profit,
-        AVG(profit + (payment_cash + payment_mpesa - revenue)) as avg_actual_profit,
-        AVG(sold_kg) as avg_sold,
+        DAYNAME(de.date) as day_name,
+        AVG(de.revenue) as avg_expected_revenue,
+        AVG(de.payment_cash + de.payment_mpesa) as avg_actual_revenue,
+        AVG(de.sold_kg * de.cost_per_kg) as avg_cost,
+        AVG(de.sold_kg) as avg_sold,
         COUNT(*) as entry_count
-      FROM daily_entries 
-      WHERE branch_id = ? AND date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-      GROUP BY DAYOFWEEK(date), DAYNAME(date)
-      ORDER BY DAYOFWEEK(date)
+      FROM daily_entries de
+      WHERE de.branch_id = ? AND de.date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+      GROUP BY DAYOFWEEK(de.date), DAYNAME(de.date)
+      ORDER BY DAYOFWEEK(de.date)
     `, [branch_id || 1, parseInt(days)]);
 
-    const result = { daily: dailyWithActual, dayOfWeek: dow, days };
+    // Calculate actual profit for day of week
+    const dowWithProfit = await Promise.all(dow.map(async (r) => {
+      const [expRows] = await db.promise().execute(`
+        SELECT COALESCE(SUM(amount), 0) as total FROM expenses
+        WHERE branch_id = ? AND DAYNAME(date) = ? AND date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+      `, [branch_id || 1, r.day_name, parseInt(days)]);
+
+      const avgExpenses = parseFloat(expRows[0].total) / (parseInt(r.entry_count) || 1);
+      const avgActualRevenue = parseFloat(r.avg_actual_revenue) || 0;
+      const avgCost = parseFloat(r.avg_cost) || 0;
+      const avgActualProfit = avgActualRevenue - avgCost - avgExpenses;
+
+      return {
+        day_name: r.day_name,
+        avg_revenue: fmt(r.avg_expected_revenue),
+        avg_actual_revenue: fmt(avgActualRevenue),
+        avg_cost: fmt(avgCost),
+        avg_actual_profit: fmt(avgActualProfit),
+        avg_sold: fmt(r.avg_sold),
+        entry_count: r.entry_count,
+        margin_pct: avgActualRevenue > 0 ? fmt((avgActualProfit / avgActualRevenue) * 100) : 0
+      };
+    }));
+
+    const result = { daily: dailyWithActual, dayOfWeek: dowWithProfit, days };
     await redis.setEx(key, 600, JSON.stringify(result));
     res.json(result);
   } catch (error) {
@@ -416,7 +449,7 @@ exports.getExpenseBreakdown = async (req, res) => {
   }
 };
 
-// COMPARATIVE (This Month vs Last Month) — FULLY UPDATED
+// COMPARATIVE (This Month vs Last Month) — CORRECTED
 exports.getComparative = async (req, res) => {
   try {
     const { branch_id } = req.query;
@@ -430,7 +463,6 @@ exports.getComparative = async (req, res) => {
       SELECT 
         COALESCE(SUM(revenue), 0) as expected_revenue, 
         COALESCE(SUM(payment_cash + payment_mpesa), 0) as actual_revenue,
-        COALESCE(SUM(profit), 0) as expected_profit, 
         COALESCE(SUM(sold_kg * cost_per_kg), 0) as total_cost,
         COALESCE(SUM(sold_kg), 0) as sold, 
         COALESCE(AVG(waste_kg), 0) as avg_waste
@@ -445,7 +477,6 @@ exports.getComparative = async (req, res) => {
       SELECT 
         COALESCE(SUM(revenue), 0) as expected_revenue, 
         COALESCE(SUM(payment_cash + payment_mpesa), 0) as actual_revenue,
-        COALESCE(SUM(profit), 0) as expected_profit, 
         COALESCE(SUM(sold_kg * cost_per_kg), 0) as total_cost,
         COALESCE(SUM(sold_kg), 0) as sold, 
         COALESCE(AVG(waste_kg), 0) as avg_waste
@@ -473,32 +504,31 @@ exports.getComparative = async (req, res) => {
     const thisExp = parseFloat(thisMonthExp[0]?.total) || 0;
     const lastExp = parseFloat(lastMonthExp[0]?.total) || 0;
 
+    const thisActualRevenue = parseFloat(thisMonthRows[0].actual_revenue);
+    const thisCost = parseFloat(thisMonthRows[0].total_cost);
+    const lastActualRevenue = parseFloat(lastMonthRows[0].actual_revenue);
+    const lastCost = parseFloat(lastMonthRows[0].total_cost);
+
     const thisMonth = {
       expected_revenue: fmt(thisMonthRows[0].expected_revenue),
-      actual_revenue: fmt(thisMonthRows[0].actual_revenue),
-      total_cost: fmt(thisMonthRows[0].total_cost),
-      expected_profit: fmt(thisMonthRows[0].expected_profit),
-      actual_profit: fmt(parseFloat(thisMonthRows[0].actual_revenue) - parseFloat(thisMonthRows[0].total_cost) - thisExp),
+      actual_revenue: fmt(thisActualRevenue),
+      total_cost: fmt(thisCost),
+      expected_profit: fmt(parseFloat(thisMonthRows[0].expected_revenue) - thisCost - thisExp),
+      actual_profit: fmt(thisActualRevenue - thisCost - thisExp),
       sold: fmt(thisMonthRows[0].sold),
       avg_waste: fmt(thisMonthRows[0].avg_waste),
       expenses: fmt(thisExp),
-      // backward compatibility
-      revenue: fmt(thisMonthRows[0].expected_revenue),
-      profit: fmt(thisMonthRows[0].expected_profit),
     };
 
     const lastMonth = {
       expected_revenue: fmt(lastMonthRows[0].expected_revenue),
-      actual_revenue: fmt(lastMonthRows[0].actual_revenue),
-      total_cost: fmt(lastMonthRows[0].total_cost),
-      expected_profit: fmt(lastMonthRows[0].expected_profit),
-      actual_profit: fmt(parseFloat(lastMonthRows[0].actual_revenue) - parseFloat(lastMonthRows[0].total_cost) - lastExp),
+      actual_revenue: fmt(lastActualRevenue),
+      total_cost: fmt(lastCost),
+      expected_profit: fmt(parseFloat(lastMonthRows[0].expected_revenue) - lastCost - lastExp),
+      actual_profit: fmt(lastActualRevenue - lastCost - lastExp),
       sold: fmt(lastMonthRows[0].sold),
       avg_waste: fmt(lastMonthRows[0].avg_waste),
       expenses: fmt(lastExp),
-      // backward compatibility
-      revenue: fmt(lastMonthRows[0].expected_revenue),
-      profit: fmt(lastMonthRows[0].expected_profit),
     };
 
     const calcChange = (curr, prev) => prev ? fmt(((curr - prev) / prev) * 100) : 0;
@@ -513,9 +543,6 @@ exports.getComparative = async (req, res) => {
         actual_profit: calcChange(thisMonth.actual_profit, lastMonth.actual_profit),
         sold: calcChange(thisMonth.sold, lastMonth.sold),
         waste: calcChange(thisMonth.avg_waste, lastMonth.avg_waste),
-        // backward compatibility
-        revenue: calcChange(thisMonth.revenue, lastMonth.revenue),
-        profit: calcChange(thisMonth.profit, lastMonth.profit),
       }
     };
     await redis.setEx(key, 900, JSON.stringify(result));
