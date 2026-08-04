@@ -567,7 +567,7 @@ exports.getBranches = async (req, res) => {
   }
 };
 
-// ===== CLEAR CACHE =====
+// ===== CLEAR CACHE =====----
 exports.clearCache = async (req, res) => {
   try {
     await redis.flushDb();
