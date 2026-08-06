@@ -61,7 +61,7 @@ const calculateDateTotals = async (date, branch_id = null) => {
 
 
 
-// CREATE OR UPDATE DAILY ENTRY
+// CREATE OR UPDATE DAILY ENTRY — FIXED
 exports.createOrUpdateDailyOperation = async (req, res) => {
   try {
     const {
@@ -91,10 +91,24 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
     const mpesa = parseFloat(payment_mpesa) || 0;
 
     const sold_kg = opening + supply - waste - closing;
-    const revenue = sold_kg * sellPrice;
-    const total_cost = sold_kg * cost;
-    const expenses = cash + mpesa;
-    const profit = revenue - total_cost - expenses;
+    const expected_revenue = sold_kg * sellPrice;     // What stock says you should make
+    const actual_revenue = cash + mpesa;              // ✅ REAL MONEY you collected
+    const cogs = sold_kg * cost;                      // Cost of goods sold
+
+    // Fetch REAL expenses from expenses table for this date
+    let total_expenses = 0;
+    try {
+      const [expRows] = await db.promise().execute(
+        `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date = ? AND branch_id = ?`,
+        [date, branch_id]
+      );
+      total_expenses = parseFloat(expRows[0].total) || 0;
+    } catch (e) {
+      total_expenses = 0;
+    }
+
+    const profit = actual_revenue - cogs - total_expenses;         // ✅ REAL PROFIT
+    const expected_profit = expected_revenue - cogs - total_expenses;
 
     if (sold_kg < 0) {
       return res.status(400).json({ 
@@ -126,8 +140,8 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
 
     await db.promise().execute(query, [
       branch_id, date, opening, supply, waste, sold_kg,
-      closing, cost, sellPrice, revenue,
-      expenses, profit, cash, mpesa
+      closing, cost, sellPrice, expected_revenue,
+      total_expenses, profit, cash, mpesa
     ]);
 
     // Invalidate cached reports since data changed
@@ -135,7 +149,17 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
 
     res.status(200).json({
       message: "Daily operation saved successfully",
-      data: { branch_id, date, sold_kg, revenue, total_cost, expenses, profit }
+      data: { 
+        branch_id, 
+        date, 
+        sold_kg, 
+        expected_revenue, 
+        actual_revenue, 
+        cogs, 
+        total_expenses, 
+        profit,
+        expected_profit 
+      }
     });
 
   } catch (error) {
@@ -144,13 +168,12 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
 };
 
 
-// GET LAST ENTRY
+// GET LAST ENTRY — FIXED
 exports.getLastEntry = async (req, res) => {
   try {
     const { branch_id } = req.query;
     const cacheKey = `daily:last-entry:${branch_id || 'all'}`;
 
-    // Check Redis first
     const cached = await redis.get(cacheKey);
     if (cached) {
       return res.status(200).json(JSON.parse(cached));
@@ -216,9 +239,7 @@ exports.getLastEntry = async (req, res) => {
       netMargin: actualProfit,
     };
 
-    // Cache for 5 minutes
     await redis.setEx(cacheKey, 300, JSON.stringify(result));
-
     res.status(200).json(result);
 
   } catch (error) {
@@ -226,7 +247,7 @@ exports.getLastEntry = async (req, res) => {
   }
 };
 
-// GET ENTRY BY DATE
+// GET ENTRY BY DATE — FIXED
 exports.getEntryByDate = async (req, res) => {
   try {
     const { branch_id } = req.query;
@@ -245,14 +266,12 @@ exports.getEntryByDate = async (req, res) => {
 
     const entry = rows[0];
 
-    // ===== CALCULATE ACTUAL REVENUE & PROFIT =====
     const expectedRevenue = parseFloat(entry.revenue) || 0;
     const paymentCash = parseFloat(entry.payment_cash) || 0;
     const paymentMpesa = parseFloat(entry.payment_mpesa) || 0;
     const actualRevenue = paymentCash + paymentMpesa;
     const cogs = (parseFloat(entry.sold_kg) || 0) * (parseFloat(entry.cost_per_kg) || 0);
 
-    // Fetch actual expenses for this date from expenses table
     let totalExpenses = 0;
     try {
       const [expRows] = await db.promise().execute(
@@ -271,20 +290,16 @@ exports.getEntryByDate = async (req, res) => {
 
     const result = {
       ...entry,
-      // Actual (real money)
       actualRevenue,
       actualProfit,
       marginPct: parseFloat(marginPct),
-      // Expected (stock math)
       expectedRevenue,
       expectedProfit,
-      // Breakdown
       revenueVariance,
       paymentCash,
       paymentMpesa,
       cogs,
       totalExpenses,
-      // Backward compat
       totalRevenue: actualRevenue,
       netMargin: actualProfit,
     };
