@@ -4,7 +4,7 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 
-const { verifyFirebaseToken, requireAdmin } = require('./middleware/auth_middleware');
+// const { verifyFirebaseToken, requireAdmin } = require('./middleware/auth_middleware');
 
 // Create app
 const app = express();
@@ -40,7 +40,7 @@ app.use('/api', require('./routes/subscriptionRoutes'));
 app.use('/api', require('./routes/businessRoutes'));
 
 // ==================== ADMIN ROUTES (Auth + Admin Check) ====================
-app.use('/api/admin', verifyFirebaseToken, requireAdmin, require('./routes/adminRoutes'));
+app.use('/api/admin',require('./routes/adminRoutes'));
 
 // ==================== ERROR HANDLING ====================
 // 404 handler
