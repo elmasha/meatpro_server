@@ -3,8 +3,6 @@ const redis = require('../config/redis');
 const request = require('request');
 const moment = require('moment');
 
-
-
 // ── M-Pesa Helper ────────────────────────────────────────────────────
 async function getMpesaToken() {
   const consumerKey = process.env.PROD_CONSUMER_KEY_DEV;
@@ -42,8 +40,28 @@ async function getUserPhone(userId) {
   return rows[0]?.phone || null;
 }
 
+async function getUserFirebaseUid(userId) {
+  const [rows] = await db.promise().query(
+    'SELECT firebase_uid FROM users WHERE id = ? LIMIT 1', [userId]
+  );
+  return rows[0]?.firebase_uid || null;
+}
+
 function invalidateUserCache(firebase_uid) {
+  if (!firebase_uid) return;
   redis.del(`sub:status:${firebase_uid}`).catch(() => {});
+}
+
+// FIXED: Nairobi timezone timestamp for M-Pesa
+function getMpesaTimestamp() {
+  const now = new Date();
+  const nairobiTime = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+  return nairobiTime.getFullYear() +
+    String(nairobiTime.getMonth() + 1).padStart(2, '0') +
+    String(nairobiTime.getDate()).padStart(2, '0') +
+    String(nairobiTime.getHours()).padStart(2, '0') +
+    String(nairobiTime.getMinutes()).padStart(2, '0') +
+    String(nairobiTime.getSeconds()).padStart(2, '0');
 }
 
 // ── GET /api/plans ───────────────────────────────────────────────────
@@ -61,7 +79,8 @@ exports.getPlans = async (req, res) => {
 // ── GET /api/subscriptions/status ────────────────────────────────────
 exports.getStatus = async (req, res) => {
   try {
-    const firebase_uid = req.query.firebase_uid;
+    // FIXED: Use req.firebase_uid from auth middleware
+    const firebase_uid = req.firebase_uid;
     if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
 
     const cacheKey = `sub:status:${firebase_uid}`;
@@ -120,7 +139,8 @@ exports.getStatus = async (req, res) => {
 // ── GET /api/subscriptions/history ───────────────────────────────────
 exports.getPaymentHistory = async (req, res) => {
   try {
-    const firebase_uid = req.query.firebase_uid;
+    // FIXED: Use req.firebase_uid from auth middleware
+    const firebase_uid = req.firebase_uid;
     if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
 
     const userId = await getUserId(firebase_uid);
@@ -141,7 +161,8 @@ exports.getPaymentHistory = async (req, res) => {
 // ── GET /api/subscriptions/latest-receipt ────────────────────────────
 exports.getLatestReceipt = async (req, res) => {
   try {
-    const firebase_uid = req.query.firebase_uid;
+    // FIXED: Use req.firebase_uid from auth middleware
+    const firebase_uid = req.firebase_uid;
     if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
 
     const userId = await getUserId(firebase_uid);
@@ -171,7 +192,10 @@ exports.getLatestReceipt = async (req, res) => {
 // ── POST /api/subscriptions/initiate ─────────────────────────────────
 exports.initiatePayment = async (req, res) => {
   try {
-    const { firebase_uid, plan_id, phone } = req.body;
+    // FIXED: Use req.firebase_uid from auth middleware
+    const firebase_uid = req.firebase_uid;
+    const { plan_id, phone } = req.body;
+
     if (!firebase_uid || !plan_id || !phone) {
       return res.status(400).json({ message: 'firebase_uid, plan_id, and phone required' });
     }
@@ -200,7 +224,8 @@ exports.initiatePayment = async (req, res) => {
     );
 
     const token = await getMpesaToken();
-    const timestamp = new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
+    // FIXED: Use Nairobi timezone
+    const timestamp = getMpesaTimestamp();
     const shortcode = process.env.PROD_SHORTCODE_DEV;
     const passkey = process.env.PROD_PASSKEY_DEV;
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
@@ -286,11 +311,10 @@ exports.mpesaCallback = async (req, res) => {
 
       const userId = paymentRows[0].user_id;
 
-     await connection.query(
-        `UPDATE payments SET mpesa_receipt = ?,status = ?, transaction_date = ? WHERE checkout_request_id = ? AND user_id = ?`,
+      await connection.query(
+        `UPDATE payments SET mpesa_receipt = ?, status = ?, transaction_date = ? WHERE checkout_request_id = ? AND user_id = ?`,
         [receipt, 'success', transactionDate, checkoutRequestId, userId]
       );
-
 
       await connection.query(
         `UPDATE subscriptions SET status = 'active', start_date = CURDATE(), end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), mpesa_receipt = ?
@@ -306,8 +330,9 @@ exports.mpesaCallback = async (req, res) => {
 
       await connection.commit();
 
-  
-      invalidateUserCache(userId);
+      // FIXED: Fetch firebase_uid before invalidating cache
+      const firebase_uid = await getUserFirebaseUid(userId);
+      invalidateUserCache(firebase_uid);
     } else {
       await connection.query(
         `UPDATE payments SET mpesa_receipt = 'FAILED' WHERE checkout_request_id = ?`,
@@ -332,7 +357,10 @@ exports.confirmDemo = async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    const { subscription_id, firebase_uid } = req.body;
+    const { subscription_id } = req.body;
+    // FIXED: Use req.firebase_uid from auth middleware
+    const firebase_uid = req.firebase_uid;
+
     if (!subscription_id || !firebase_uid) {
       connection.release();
       return res.status(400).json({ message: 'subscription_id and firebase_uid required' });
@@ -376,7 +404,7 @@ exports.confirmDemo = async (req, res) => {
     await connection.commit();
     connection.release();
 
-  
+    // FIXED: Pass firebase_uid string (already have it from req)
     invalidateUserCache(firebase_uid);
     res.json({ message: 'Subscription activated successfully', receipt_used: realReceipt });
   } catch (error) {
@@ -390,7 +418,8 @@ exports.confirmDemo = async (req, res) => {
 // ── POST /api/subscriptions/cancel ───────────────────────────────────
 exports.cancelSubscription = async (req, res) => {
   try {
-    const { firebase_uid } = req.body;
+    // FIXED: Use req.firebase_uid from auth middleware
+    const firebase_uid = req.firebase_uid;
     if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
 
     const userId = await getUserId(firebase_uid);
@@ -444,7 +473,8 @@ exports.queryStkStatus = async (req, res) => {
     if (!checkout_request_id) return res.status(400).json({ message: 'checkout_request_id is required' });
 
     const token = await getMpesaToken();
-    const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
+    // FIXED: Use Nairobi timezone
+    const timestamp = getMpesaTimestamp();
     const shortcode = process.env.PROD_SHORTCODE_DEV;
     const passkey = process.env.PROD_PASSKEY_DEV;
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');

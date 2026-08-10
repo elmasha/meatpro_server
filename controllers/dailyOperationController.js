@@ -9,10 +9,21 @@ const invalidateDailyCache = async (branch_id, date) => {
     `report:last-7-days:${branch_id || 'all'}`,
     `report:month-to-date:${branch_id || 'all'}`
   ];
-  
   for (const key of keys) {
     await redis.del(key);
   }
+};
+
+// ===== VERIFY BRANCH ACCESS =====
+const verifyBranchAccess = async (firebase_uid, branch_id) => {
+  const [rows] = await db.promise().execute(
+    `SELECT 1 FROM branches br
+     JOIN businesses b ON br.business_id = b.id
+     WHERE br.id = ? AND (b.firebase_uid = ? OR br.manager_uid = ?)
+     LIMIT 1`,
+    [branch_id, firebase_uid, firebase_uid]
+  );
+  return rows.length > 0;
 };
 
 // ===== SINGLE DATE TOTALS HELPER =====
@@ -22,7 +33,7 @@ const calculateDateTotals = async (date, branch_id = null) => {
       COALESCE(SUM(revenue), 0) as totalRevenue,
       COALESCE(SUM(payment_cash + payment_mpesa), 0) as totalActualRevenue,
       COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCost,
-      COALESCE(SUM(profit), 0) as totalProfit
+      COALESCE(SUM(sold_kg), 0) as totalSoldKg
     FROM daily_entries 
     WHERE date = ?
   `;
@@ -50,18 +61,28 @@ const calculateDateTotals = async (date, branch_id = null) => {
 
   const [expRows] = await db.promise().execute(expQuery, expParams);
 
+  const totalRevenue = parseFloat(ops.totalRevenue);
+  const totalActualRevenue = parseFloat(ops.totalActualRevenue);
+  const totalCost = parseFloat(ops.totalCost);
+  const totalExpenses = parseFloat(expRows[0].totalExpenses);
+
+  // CORRECT: Calculate profit from ground truth
+  const totalActualProfit = totalActualRevenue - totalCost - totalExpenses;
+  const totalExpectedProfit = totalRevenue - totalCost - totalExpenses;
+
   return {
-    totalRevenue: parseFloat(ops.totalRevenue),
-    totalActualRevenue: parseFloat(ops.totalActualRevenue),
-    totalCost: parseFloat(ops.totalCost),
-    totalExpenses: parseFloat(expRows[0].totalExpenses),
-    totalProfit: parseFloat(ops.totalProfit)
+    totalRevenue: fmt(totalRevenue),
+    totalActualRevenue: fmt(totalActualRevenue),
+    totalCost: fmt(totalCost),
+    totalExpenses: fmt(totalExpenses),
+    totalProfit: fmt(totalActualProfit),        // CORRECTED
+    totalExpectedProfit: fmt(totalExpectedProfit),
+    totalSoldKg: fmt(ops.totalSoldKg),
+    revenueVariance: fmt(totalRevenue - totalActualRevenue)
   };
 };
 
-
-
-// CREATE OR UPDATE DAILY ENTRY — FIXED
+// CREATE OR UPDATE DAILY ENTRY
 exports.createOrUpdateDailyOperation = async (req, res) => {
   try {
     const {
@@ -77,8 +98,16 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
       payment_mpesa
     } = req.body;
 
+    const firebase_uid = req.body.firebase_uid; // injected by auth middleware
+
     if (!date || !branch_id) {
       return res.status(400).json({ message: "Date and branch_id are required" });
+    }
+
+    // Verify branch ownership
+    const hasAccess = await verifyBranchAccess(firebase_uid, branch_id);
+    if (!hasAccess) {
+      return res.status(403).json({ message: "Forbidden — you do not own this branch" });
     }
 
     const opening = parseFloat(opening_stock_kg) || 0;
@@ -91,9 +120,9 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
     const mpesa = parseFloat(payment_mpesa) || 0;
 
     const sold_kg = opening + supply - waste - closing;
-    const expected_revenue = sold_kg * sellPrice;     // What stock says you should make
-    const actual_revenue = cash + mpesa;              // ✅ REAL MONEY you collected
-    const cogs = sold_kg * cost;                      // Cost of goods sold
+    const expected_revenue = sold_kg * sellPrice;
+    const actual_revenue = cash + mpesa;
+    const cogs = sold_kg * cost;
 
     // Fetch REAL expenses from expenses table for this date
     let total_expenses = 0;
@@ -107,7 +136,7 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
       total_expenses = 0;
     }
 
-    const profit = actual_revenue - cogs - total_expenses;         // ✅ REAL PROFIT
+    const profit = actual_revenue - cogs - total_expenses;
     const expected_profit = expected_revenue - cogs - total_expenses;
 
     if (sold_kg < 0) {
@@ -144,7 +173,6 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
       total_expenses, profit, cash, mpesa
     ]);
 
-    // Invalidate cached reports since data changed
     await invalidateDailyCache(branch_id, date);
 
     res.status(200).json({
@@ -167,11 +195,11 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
   }
 };
 
-
-// GET LAST ENTRY — FIXED
+// GET LAST ENTRY
 exports.getLastEntry = async (req, res) => {
   try {
     const { branch_id } = req.query;
+    const firebase_uid = req.query.firebase_uid;
     const cacheKey = `daily:last-entry:${branch_id || 'all'}`;
 
     const cached = await redis.get(cacheKey);
@@ -183,6 +211,11 @@ exports.getLastEntry = async (req, res) => {
     const params = [];
 
     if (branch_id) {
+      // Verify access
+      const hasAccess = await verifyBranchAccess(firebase_uid, branch_id);
+      if (!hasAccess) {
+        return res.status(403).json({ message: "Forbidden — you do not own this branch" });
+      }
       query = `SELECT * FROM daily_entries WHERE branch_id = ? ORDER BY date DESC, id DESC LIMIT 1`;
       params.push(branch_id);
     }
@@ -195,14 +228,12 @@ exports.getLastEntry = async (req, res) => {
 
     const entry = rows[0];
 
-    // ===== CALCULATE ACTUAL REVENUE & PROFIT =====
     const expectedRevenue = parseFloat(entry.revenue) || 0;
     const paymentCash = parseFloat(entry.payment_cash) || 0;
     const paymentMpesa = parseFloat(entry.payment_mpesa) || 0;
     const actualRevenue = paymentCash + paymentMpesa;
     const cogs = (parseFloat(entry.sold_kg) || 0) * (parseFloat(entry.cost_per_kg) || 0);
 
-    // Fetch actual expenses for this date from expenses table
     let totalExpenses = 0;
     try {
       const [expRows] = await db.promise().execute(
@@ -221,20 +252,16 @@ exports.getLastEntry = async (req, res) => {
 
     const result = {
       ...entry,
-      // Actual (real money)
       actualRevenue,
       actualProfit,
       marginPct: parseFloat(marginPct),
-      // Expected (stock math)
       expectedRevenue,
       expectedProfit,
-      // Breakdown
       revenueVariance,
       paymentCash,
       paymentMpesa,
       cogs,
       totalExpenses,
-      // Backward compat
       totalRevenue: actualRevenue,
       netMargin: actualProfit,
     };
@@ -247,14 +274,20 @@ exports.getLastEntry = async (req, res) => {
   }
 };
 
-// GET ENTRY BY DATE — FIXED
+// GET ENTRY BY DATE
 exports.getEntryByDate = async (req, res) => {
   try {
     const { branch_id } = req.query;
     const { date } = req.params;
+    const firebase_uid = req.query.firebase_uid;
 
     if (!date || !branch_id) {
       return res.status(400).json({ message: "Date and branch_id are required" });
+    }
+
+    const hasAccess = await verifyBranchAccess(firebase_uid, branch_id);
+    if (!hasAccess) {
+      return res.status(403).json({ message: "Forbidden — you do not own this branch" });
     }
 
     const query = `SELECT * FROM daily_entries WHERE date = ? AND branch_id = ?`;
@@ -316,14 +349,84 @@ exports.getDateTotals = async (req, res) => {
   try {
     const { branch_id } = req.query;
     const { date } = req.params;
+    const firebase_uid = req.query.firebase_uid;
 
     if (!date || !branch_id) {
       return res.status(400).json({ message: "Date and branch_id are required" });
     }
 
-    const totals = await calculateDateTotals(date, branch_id);
+    const hasAccess = await verifyBranchAccess(firebase_uid, branch_id);
+    if (!hasAccess) {
+      return res.status(403).json({ message: "Forbidden — you do not own this branch" });
+    }
 
+    const totals = await calculateDateTotals(date, branch_id);
     res.status(200).json(totals);
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// PATCH PAYMENTS (recalculates profit)
+exports.patchPayments = async (req, res) => {
+  try {
+    const { payment_cash, payment_mpesa } = req.body;
+    const branch_id = parseInt(req.params.branch_id);
+    const date = req.params.date;
+    const firebase_uid = req.body.firebase_uid;
+
+    const hasAccess = await verifyBranchAccess(firebase_uid, branch_id);
+    if (!hasAccess) {
+      return res.status(403).json({ message: "Forbidden — you do not own this branch" });
+    }
+
+    const cash = parseFloat(payment_cash) || 0;
+    const mpesa = parseFloat(payment_mpesa) || 0;
+
+    // Fetch the entry to recalculate
+    const [rows] = await db.promise().execute(
+      `SELECT * FROM daily_entries WHERE branch_id = ? AND date = ?`,
+      [branch_id, date]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: "Entry not found" });
+    }
+
+    const entry = rows[0];
+    const actualRevenue = cash + mpesa;
+    const cogs = (parseFloat(entry.sold_kg) || 0) * (parseFloat(entry.cost_per_kg) || 0);
+
+    let totalExpenses = 0;
+    try {
+      const [expRows] = await db.promise().execute(
+        `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date = ? AND branch_id = ?`,
+        [date, branch_id]
+      );
+      totalExpenses = parseFloat(expRows[0].total) || 0;
+    } catch (e) {
+      totalExpenses = 0;
+    }
+
+    const profit = actualRevenue - cogs - totalExpenses;
+
+    await db.promise().execute(
+      `UPDATE daily_entries 
+       SET payment_cash = ?, payment_mpesa = ?, profit = ?
+       WHERE branch_id = ? AND date = ?`,
+      [cash, mpesa, profit, branch_id, date]
+    );
+
+    await invalidateDailyCache(branch_id, date);
+
+    res.json({ 
+      message: 'Payments updated', 
+      actualRevenue, 
+      profit,
+      totalExpenses,
+      cogs 
+    });
 
   } catch (error) {
     res.status(500).json({ message: error.message });

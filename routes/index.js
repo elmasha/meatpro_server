@@ -8,33 +8,12 @@ const expenses = require('../controllers/expenseController');
 const reports = require('../controllers/reportController');
 const stock = require('../controllers/stockController');
 
-
-// GET /daily-operations/last?branch_id=1
-// Returns the most recent entry for auto-filling opening stock
-router.get('/daily-operations/last', async (req, res) => {
-  try {
-    const { branch_id } = req.query;
-    const [rows] = await db.promise().execute(
-      `SELECT * FROM daily_entries 
-       WHERE branch_id = ? 
-       ORDER BY date DESC, id DESC 
-       LIMIT 1`,
-      [parseInt(branch_id) || 1]
-    );
-    res.json(rows[0] || null);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
-
 // GET /daily-operations?branch_id=1&limit=10
-// Recent entries table
 router.get('/daily-operations', async (req, res) => {
   try {
     const branch_id = parseInt(req.query.branch_id) || 1;
     const limit = parseInt(req.query.limit) || 10;
 
-    // ✅ Use .query() with pool — more reliable than .execute()
     const [rows] = await db.promise().query(
       `SELECT date, sold_kg, revenue, (sold_kg * cost_per_kg) as total_cost, 
               profit, closing_stock_kg 
@@ -51,37 +30,86 @@ router.get('/daily-operations', async (req, res) => {
   }
 });
 
+// GET /daily-operations/last?branch_id=1
+// Uses the CONTROLLER — not inline — so actual revenue/profit calculations run
+router.get('/daily-operations/last', dailyOps.getLastEntry);
+
+// GET /daily-operations/:date?branch_id=1
+router.get('/daily-operations/:date', dailyOps.getEntryByDate);
+
 // PATCH /daily-operations/:branch_id/:date
-// Update only payment fields
+// Updates payments AND recalculates profit via controller
 router.patch('/daily-operations/:branch_id/:date', async (req, res) => {
   try {
     const { payment_cash, payment_mpesa } = req.body;
-    
-    // Parse to ensure proper types
     const cash = parseFloat(payment_cash) || 0;
     const mpesa = parseFloat(payment_mpesa) || 0;
     const branch_id = parseInt(req.params.branch_id);
     const date = req.params.date;
 
-    // ✅ Use .query() instead of .execute() for pool
+    // Update payments
     await db.promise().query(
       `UPDATE daily_entries 
        SET payment_cash = ?, payment_mpesa = ? 
        WHERE branch_id = ? AND date = ?`,
       [cash, mpesa, branch_id, date]
     );
-    
-    res.json({ message: 'Payments updated' });
+
+    // Recalculate profit using the controller's logic
+    const [rows] = await db.promise().execute(
+      `SELECT * FROM daily_entries WHERE date = ? AND branch_id = ?`,
+      [date, branch_id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: "Entry not found" });
+    }
+
+    const entry = rows[0];
+    const actualRevenue = cash + mpesa;
+    const cogs = (parseFloat(entry.sold_kg) || 0) * (parseFloat(entry.cost_per_kg) || 0);
+
+    // Get real expenses
+    const [expRows] = await db.promise().execute(
+      `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date = ? AND branch_id = ?`,
+      [date, branch_id]
+    );
+    const totalExpenses = parseFloat(expRows[0].total) || 0;
+
+    const profit = actualRevenue - cogs - totalExpenses;
+
+    // Write recalculated profit back
+    await db.promise().query(
+      `UPDATE daily_entries SET profit = ? WHERE branch_id = ? AND date = ?`,
+      [profit, branch_id, date]
+    );
+
+    // Invalidate cache
+    const keys = [
+      `stock:current:${branch_id}`,
+      `report:last-entry:${branch_id}`,
+      `report:last-7-days:${branch_id}`,
+      `report:month-to-date:${branch_id}`
+    ];
+    for (const key of keys) {
+      await redis.del(key);
+    }
+
+    res.json({ 
+      message: 'Payments and profit updated',
+      actualRevenue,
+      cogs,
+      totalExpenses,
+      profit
+    });
   } catch (error) {
     console.error('Patch error:', error);
     res.status(500).json({ message: error.message });
   }
 });
 
-
 // Daily Operations
 router.post('/daily-operations', dailyOps.createOrUpdateDailyOperation);
-router.get('/daily-operations/last', dailyOps.getLastEntry);
 
 // Expenses
 router.post('/expenses', expenses.createExpense);
@@ -94,11 +122,5 @@ router.get('/reports/month-to-date', reports.getMonthToDateReport);
 
 // Stock
 router.get('/stock/current', stock.getCurrentStock);
-
-
-// routes/dashboard.js or add to your existing router
-
-
-
 
 module.exports = router;

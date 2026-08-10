@@ -50,7 +50,7 @@ const calculateTotals = async (startDate, endDate, branch_id = null) => {
   const totalCost = parseFloat(ops.totalCost);
   const totalExpenses = parseFloat(expRows[0].totalExpenses);
 
-  // CORRECTED: Calculate actual profit from real numbers
+  // CORRECTED: Calculate actual profit from real numbers (ground truth)
   const totalActualProfit = totalActualRevenue - totalCost - totalExpenses;
   const totalExpectedProfit = totalRevenue - totalCost - totalExpenses;
 
