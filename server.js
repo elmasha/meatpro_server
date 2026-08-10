@@ -28,7 +28,7 @@ app.use('/api/subscriptions/callback', require('./routes/subscriptionRoutes'));
 
 // ==================== PROTECTED ROUTES (Firebase Auth Required) ====================
 // Apply auth middleware to all /api/* routes below this line
-app.use('/api');
+// app.use('/api');
 
 // Mount protected routes
 app.use('/api', require('./routes/index'));              // dashboard routes
@@ -40,7 +40,7 @@ app.use('/api', require('./routes/subscriptionRoutes'));
 app.use('/api', require('./routes/businessRoutes'));
 
 // ==================== ADMIN ROUTES (Auth + Admin Check) ====================
-app.use('/api/admin',require('./routes/adminRoutes'));
+// app.use('/api/admin',require('./routes/adminRoutes'));
 
 // ==================== ERROR HANDLING ====================
 // 404 handler
