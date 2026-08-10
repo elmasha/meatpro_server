@@ -28,7 +28,7 @@ app.use('/api/subscriptions/callback', require('./routes/subscriptionRoutes'));
 
 // ==================== PROTECTED ROUTES (Firebase Auth Required) ====================
 // Apply auth middleware to all /api/* routes below this line
-app.use('/api', verifyFirebaseToken);
+app.use('/api');
 
 // Mount protected routes
 app.use('/api', require('./routes/index'));              // dashboard routes
