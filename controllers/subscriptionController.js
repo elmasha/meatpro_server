@@ -79,8 +79,7 @@ exports.getPlans = async (req, res) => {
 // ── GET /api/subscriptions/status ────────────────────────────────────
 exports.getStatus = async (req, res) => {
   try {
-    // FIXED: Use req.firebase_uid from auth middleware
-    const firebase_uid = req.firebase_uid;
+    const firebase_uid = req.query.firebase_uid;
     if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
 
     const cacheKey = `sub:status:${firebase_uid}`;
@@ -139,8 +138,7 @@ exports.getStatus = async (req, res) => {
 // ── GET /api/subscriptions/history ───────────────────────────────────
 exports.getPaymentHistory = async (req, res) => {
   try {
-    // FIXED: Use req.firebase_uid from auth middleware
-    const firebase_uid = req.firebase_uid;
+    const firebase_uid = req.query.firebase_uid;
     if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
 
     const userId = await getUserId(firebase_uid);
@@ -161,8 +159,7 @@ exports.getPaymentHistory = async (req, res) => {
 // ── GET /api/subscriptions/latest-receipt ────────────────────────────
 exports.getLatestReceipt = async (req, res) => {
   try {
-    // FIXED: Use req.firebase_uid from auth middleware
-    const firebase_uid = req.firebase_uid;
+    const firebase_uid = req.query.firebase_uid;
     if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
 
     const userId = await getUserId(firebase_uid);
@@ -192,9 +189,7 @@ exports.getLatestReceipt = async (req, res) => {
 // ── POST /api/subscriptions/initiate ─────────────────────────────────
 exports.initiatePayment = async (req, res) => {
   try {
-    // FIXED: Use req.firebase_uid from auth middleware
-    const firebase_uid = req.firebase_uid;
-    const { plan_id, phone } = req.body;
+    const { firebase_uid, plan_id, phone } = req.body;
 
     if (!firebase_uid || !plan_id || !phone) {
       return res.status(400).json({ message: 'firebase_uid, plan_id, and phone required' });
@@ -357,9 +352,7 @@ exports.confirmDemo = async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    const { subscription_id } = req.body;
-    // FIXED: Use req.firebase_uid from auth middleware
-    const firebase_uid = req.firebase_uid;
+    const { subscription_id, firebase_uid } = req.body;
 
     if (!subscription_id || !firebase_uid) {
       connection.release();
@@ -418,8 +411,7 @@ exports.confirmDemo = async (req, res) => {
 // ── POST /api/subscriptions/cancel ───────────────────────────────────
 exports.cancelSubscription = async (req, res) => {
   try {
-    // FIXED: Use req.firebase_uid from auth middleware
-    const firebase_uid = req.firebase_uid;
+    const firebase_uid = req.body.firebase_uid;
     if (!firebase_uid) return res.status(400).json({ message: 'firebase_uid required' });
 
     const userId = await getUserId(firebase_uid);
