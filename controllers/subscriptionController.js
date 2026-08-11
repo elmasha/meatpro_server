@@ -64,6 +64,59 @@ function getMpesaTimestamp() {
     String(nairobiTime.getSeconds()).padStart(2, '0');
 }
 
+// ── Helper: Log table data for debugging ──────────────────────────────
+async function logTableData(connection, label, userId, checkoutRequestId) {
+  try {
+    console.log(`\n========== ${label} ==========`);
+
+    // Log users table
+    const [users] = await connection.query('SELECT id, firebase_uid, name, phone, subscription, subscription_status, subscription_expires, mpesa_receipt, payment_date FROM users WHERE id = ?', [userId]);
+    console.log('USERS TABLE:', JSON.stringify(users, null, 2));
+
+    // Log payments table
+    const [payments] = await connection.query(
+      'SELECT id, user_id, amount, phone, mpesa_receipt, checkout_request_id, status, transaction_date, created_at FROM payments WHERE checkout_request_id = ?',
+      [checkoutRequestId]
+    );
+    console.log('PAYMENTS TABLE:', JSON.stringify(payments, null, 2));
+
+    // Log subscriptions table
+    const [subscriptions] = await connection.query(
+      'SELECT id, user_id, plan_id, plan, amount, start_date, end_date, status, payment_reference, mpesa_receipt, created_at FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 3',
+      [userId]
+    );
+    console.log('SUBSCRIPTIONS TABLE:', JSON.stringify(subscriptions, null, 2));
+
+    // Log daily_entries table (last 3 entries for this user)
+    const [dailyEntries] = await connection.query(
+      `SELECT de.id, de.branch_id, de.date, de.revenue, de.actual_revenue, de.profit, de.payment_cash, de.payment_mpesa, de.created_at 
+       FROM daily_entries de 
+       JOIN branches b ON de.branch_id = b.id 
+       JOIN businesses bu ON b.business_id = bu.id 
+       WHERE bu.firebase_uid = (SELECT firebase_uid FROM users WHERE id = ?) 
+       ORDER BY de.created_at DESC LIMIT 3`,
+      [userId]
+    );
+    console.log('DAILY_ENTRIES TABLE (last 3):', JSON.stringify(dailyEntries, null, 2));
+
+    // Log expenses table (last 3 for this user)
+    const [expenses] = await connection.query(
+      `SELECT e.id, e.branch_id, e.title, e.amount, e.date, e.created_at 
+       FROM expenses e 
+       JOIN branches b ON e.branch_id = b.id 
+       JOIN businesses bu ON b.business_id = bu.id 
+       WHERE bu.firebase_uid = (SELECT firebase_uid FROM users WHERE id = ?) 
+       ORDER BY e.created_at DESC LIMIT 3`,
+      [userId]
+    );
+    console.log('EXPENSES TABLE (last 3):', JSON.stringify(expenses, null, 2));
+
+    console.log(`========== END ${label} ==========\n`);
+  } catch (err) {
+    console.error(`Error logging table data (${label}):`, err.message);
+  }
+}
+
 // ── GET /api/plans ───────────────────────────────────────────────────
 exports.getPlans = async (req, res) => {
   try {
@@ -287,11 +340,23 @@ exports.mpesaCallback = async (req, res) => {
     const result = Body.stkCallback;
     const checkoutRequestId = result.CheckoutRequestID;
 
+    console.log('\n========== M-PESA CALLBACK RECEIVED ==========');
+    console.log('CheckoutRequestID:', checkoutRequestId);
+    console.log('ResultCode:', result.ResultCode);
+    console.log('ResultDesc:', result.ResultDesc);
+    console.log('Full Callback Body:', JSON.stringify(req.body, null, 2));
+    console.log('========== END CALLBACK HEADER ==========\n');
+
     if (result.ResultCode === 0) {
       const items = result.CallbackMetadata.Item;
       const receipt = items.find(i => i.Name === 'MpesaReceiptNumber')?.Value;
       const phone = items.find(i => i.Name === 'PhoneNumber')?.Value;
       const transactionDate = items.find(i => i.Name === 'TransactionDate')?.Value;
+
+      console.log('\n>>> PAYMENT SUCCESS - Extracted Data:');
+      console.log('  Receipt:', receipt);
+      console.log('  Phone:', phone);
+      console.log('  TransactionDate:', transactionDate);
 
       const [paymentRows] = await connection.query(
         'SELECT user_id, id FROM payments WHERE checkout_request_id = ?',
@@ -299,41 +364,60 @@ exports.mpesaCallback = async (req, res) => {
       );
 
       if (!paymentRows.length) {
+        console.error('ERROR: No payment found for checkout_request_id:', checkoutRequestId);
         await connection.rollback();
         connection.release();
         return res.json({ ResultCode: 0, ResultDesc: 'Received' });
       }
 
       const userId = paymentRows[0].user_id;
+      console.log('\n>>> Found payment record. User ID:', userId);
+
+      // LOG TABLES BEFORE UPDATE
+      await logTableData(connection, 'BEFORE UPDATE', userId, checkoutRequestId);
 
       await connection.query(
         `UPDATE payments SET mpesa_receipt = ?, status = ?, transaction_date = ? WHERE checkout_request_id = ? AND user_id = ?`,
         [receipt, 'success', transactionDate, checkoutRequestId, userId]
       );
+      console.log('>>> Updated payments table with receipt:', receipt);
 
       await connection.query(
         `UPDATE subscriptions SET status = 'active', start_date = CURDATE(), end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), mpesa_receipt = ?
          WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1`,
         [receipt, userId]
       );
+      console.log('>>> Updated subscriptions table to active');
 
       await connection.query(
         `UPDATE users SET subscription = 'pro', subscription_status = 'active', subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH),
          mpesa_receipt = ?, payment_date = NOW() WHERE id = ?`,
         [receipt, userId]
       );
+      console.log('>>> Updated users table to pro subscription');
 
       await connection.commit();
+      console.log('>>> TRANSACTION COMMITTED SUCCESSFULLY');
+
+      // LOG TABLES AFTER UPDATE
+      await logTableData(connection, 'AFTER UPDATE', userId, checkoutRequestId);
 
       // FIXED: Fetch firebase_uid before invalidating cache
       const firebase_uid = await getUserFirebaseUid(userId);
+      console.log('>>> Invalidating cache for firebase_uid:', firebase_uid);
       invalidateUserCache(firebase_uid);
     } else {
+      console.log('\n>>> PAYMENT FAILED/CANCELLED - ResultCode:', result.ResultCode);
+      console.log('>>> ResultDesc:', result.ResultDesc);
+
       await connection.query(
         `UPDATE payments SET mpesa_receipt = 'FAILED' WHERE checkout_request_id = ?`,
         [checkoutRequestId]
       );
+      console.log('>>> Updated payments table with FAILED status');
+
       await connection.commit();
+      console.log('>>> TRANSACTION COMMITTED (failure recorded)');
     }
 
     connection.release();
@@ -341,7 +425,10 @@ exports.mpesaCallback = async (req, res) => {
   } catch (error) {
     await connection.rollback();
     connection.release();
-    console.error('Callback error:', error);
+    console.error('========== CALLBACK ERROR ==========');
+    console.error('Error message:', error.message);
+    console.error('Error stack:', error.stack);
+    console.error('========== END ERROR ==========');
     res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
   }
 };
