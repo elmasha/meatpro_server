@@ -61,7 +61,7 @@ exports.getLastEntryReport = async (req, res) => {
       expectedRevenue,
       actualRevenue,
       totalCost: cogs,
-      totalExpenses,        // ✅ ADDED: live expenses
+      totalExpenses,        // ADDED: live expenses
       actualProfit,
       expectedProfit,
       expectedMargin: expectedRevenue > 0 ? ((expectedProfit / expectedRevenue) * 100).toFixed(1) : 0,
@@ -117,7 +117,7 @@ exports.getLast7DaysReport = async (req, res) => {
       totalRevenue: parseFloat(ops.totalRevenue) || 0,
       totalActualRevenue,
       totalCost,
-      totalExpenses,        // ✅ ADDED
+      totalExpenses,        // ADDED
       totalProfit: actualProfit,
       totalSold: parseFloat(ops.totalSold) || 0,
       totalWaste: parseFloat(ops.totalWaste) || 0,
@@ -173,7 +173,7 @@ exports.getMonthToDateReport = async (req, res) => {
       totalRevenue: parseFloat(ops.totalRevenue) || 0,
       totalActualRevenue,
       totalCost,
-      totalExpenses,        // ✅ ADDED
+      totalExpenses,        // ADDED
       totalProfit: actualProfit,
       totalSold: parseFloat(ops.totalSold) || 0,
       totalWaste: parseFloat(ops.totalWaste) || 0,
@@ -189,7 +189,7 @@ exports.getMonthToDateReport = async (req, res) => {
 };
 
 // GET /reports/comparative — FIXED: includes live expenses
-exports.getComparativeReport = async (req, res) => {
+exports.getComparative = async (req, res) => {
   try {
     const { branch_id } = req.query;
     const now = new Date();
@@ -244,9 +244,6 @@ exports.getComparativeReport = async (req, res) => {
     const [lastRows] = await db.promise().execute(lastQuery, lastParams);
     const lastData = lastRows[0];
 
-    const thisCost = parseFloat(thisData.sold) * 0; // We don't have avg cost, calculate from entries
-    const lastCost = parseFloat(lastData.sold) * 0;
-
     // Calculate profits with live expenses
     const thisActualProfit = parseFloat(thisData.actual_revenue) - thisMonthExpenses;
     const thisExpectedProfit = parseFloat(thisData.expected_revenue) - thisMonthExpenses;
@@ -296,7 +293,7 @@ function calculateChange(oldVal, newVal) {
 }
 
 // GET /reports/profitability
-exports.getProfitabilityReport = async (req, res) => {
+exports.getProfitability = async (req, res) => {
   try {
     const { branch_id, days = 30 } = req.query;
     const endDate = new Date().toISOString().split('T')[0];
