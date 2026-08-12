@@ -78,7 +78,7 @@ const calculateDateTotals = async (connection, branch_id, date) => {
 
 exports.createOrUpdateDailyOperation = async (req, res) => {
   try {
-    const { branch_id, date, opening_stock_kg, supply_kg, sold_kg, waste_kg, cost_per_kg, selling_price_per_kg, payment_cash, payment_mpesa } = req.body;
+    const { branch_id, date, opening_stock_kg, supply_kg, waste_kg, closing_stock_kg, cost_per_kg, selling_price_per_kg, payment_cash, payment_mpesa } = req.body;
     const firebase_uid = req.firebase_uid;
 
     if (!date || !branch_id) {
@@ -92,14 +92,16 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
 
     const opening = parseFloat(opening_stock_kg) || 0;
     const supply = parseFloat(supply_kg) || 0;
-    const sold = parseFloat(sold_kg) || 0;
     const waste = parseFloat(waste_kg) || 0;
+    const close = parseFloat(closing_stock_kg) || 0;
     const cost = parseFloat(cost_per_kg) || 0;
     const price = parseFloat(selling_price_per_kg) || 0;
     const cash = parseFloat(payment_cash) || 0;
     const mpesa = parseFloat(payment_mpesa) || 0;
 
-    const closing = opening + supply - sold - waste;
+    // ✅ CALCULATE sold_kg from stock fields (not from req.body)
+    const sold = Math.max(0, opening + supply - waste - close);
+
     const expectedRevenue = sold * price;
     const actualRevenue = cash + mpesa;
     const revenueVariance = expectedRevenue - actualRevenue;
@@ -130,7 +132,7 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
           WHERE branch_id = ? AND date = ?`,
           [opening, supply, sold, waste, cost, price, expectedRevenue,
            actualRevenue, cash, mpesa, profit, expectedProfit, revenueVariance,
-           closing, totalExpenses, branch_id, date]
+           close, totalExpenses, branch_id, date]
         );
       } else {
         await connection.execute(
@@ -142,7 +144,7 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [branch_id, date, opening, supply, sold, waste, cost, price,
            expectedRevenue, actualRevenue, cash, mpesa, profit, expectedProfit,
-           revenueVariance, closing, totalExpenses]
+           revenueVariance, close, totalExpenses]
         );
       }
 
@@ -151,17 +153,18 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
       res.status(200).json({
         message: existing.length > 0 ? "Entry updated" : "Entry created",
         data: {
-          date, opening_stock_kg: opening, supply_kg: supply, sold_kg: sold,
-          waste_kg: waste, cost_per_kg: cost, selling_price_per_kg: price,
+          date, opening_stock_kg: opening, supply_kg: supply, sold_kg: sold, waste_kg: waste,
+          cost_per_kg: cost, selling_price_per_kg: price,
           expectedRevenue, actualRevenue, payment_cash: cash, payment_mpesa: mpesa,
           cogs, totalCost: totalExpenses, totalExpenses, profit, expectedProfit,
-          revenueVariance, closing_stock_kg: closing
+          revenueVariance, closing_stock_kg: close
         }
       });
     } finally {
       connection.release();
     }
   } catch (error) {
+    console.error('createOrUpdateDailyOperation ERROR:', error);
     res.status(500).json({ message: error.message });
   }
 };
