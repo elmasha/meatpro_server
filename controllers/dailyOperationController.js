@@ -65,7 +65,7 @@ const calculateDateTotals = async (date, branch_id = null) => {
   return {
     totalRevenue: parseFloat(ops.totalRevenue),
     totalActualRevenue: totalActualRevenue,
-    totalCogs: totalCogs,                          // COGS = meat cost only
+    totalCogs: totalCogs,                          // COGS = meat cost
     totalCost: totalExpenses,                      // ✅ TOTAL COST = expenses only
     totalExpenses: totalExpenses,                  // Same as totalCost
     totalProfit: totalActualRevenue - totalCogs - totalExpenses  // Recalculated live
@@ -226,7 +226,7 @@ exports.getLastEntry = async (req, res) => {
       paymentCash,
       paymentMpesa,
       cogs,                        // COGS = meat cost
-      totalCost: totalExpenses,   // ✅ TOTAL COST = expenses only (LIVE)
+      totalCost: totalExpenses,   // ✅ TOTAL COST = live expenses
       totalExpenses,               // Same as totalCost
       totalRevenue: actualRevenue,
       netMargin: actualProfit,
@@ -284,7 +284,7 @@ exports.getEntryByDate = async (req, res) => {
       paymentCash,
       paymentMpesa,
       cogs,
-      totalCost: totalExpenses,     // ✅ TOTAL COST = expenses only (LIVE)
+      totalCost: totalExpenses,     // ✅ TOTAL COST = live expenses
       totalExpenses,
       totalRevenue: actualRevenue,
       netMargin: actualProfit,
