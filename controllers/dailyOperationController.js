@@ -5,7 +5,7 @@ const redis = require('../config/redis');
 const invalidateDailyCache = async (branch_id, date) => {
   const keys = [
     `stock:current:${branch_id || 'all'}`,
-    `daily:last-entry:${branch_id || 'all'}`,      // FIXED: was report:last-entry
+    `daily:last-entry:${branch_id || 'all'}`,
     `report:last-7-days:${branch_id || 'all'}`,
     `report:month-to-date:${branch_id || 'all'}`,
     `expenses:${date}:${branch_id}`
@@ -16,13 +16,23 @@ const invalidateDailyCache = async (branch_id, date) => {
   }
 };
 
+// ===== LIVE EXPENSES HELPER =====
+const getLiveExpenses = async (date, branch_id) => {
+  const [expRows] = await db.promise().execute(
+    `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date = ? AND branch_id = ?`,
+    [date, branch_id]
+  );
+  return parseFloat(expRows[0].total) || 0;
+};
+
 // ===== SINGLE DATE TOTALS HELPER =====
 const calculateDateTotals = async (date, branch_id = null) => {
+  // Operations data
   let opsQuery = `
     SELECT
       COALESCE(SUM(revenue), 0) as totalRevenue,
       COALESCE(SUM(payment_cash + payment_mpesa), 0) as totalActualRevenue,
-      COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCost,
+      COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCogs,
       COALESCE(SUM(profit), 0) as totalProfit
     FROM daily_entries 
     WHERE date = ?
@@ -37,30 +47,32 @@ const calculateDateTotals = async (date, branch_id = null) => {
   const [opsRows] = await db.promise().execute(opsQuery, opsParams);
   const ops = opsRows[0];
 
-  let expQuery = `
-    SELECT COALESCE(SUM(amount), 0) as totalExpenses 
-    FROM expenses 
-    WHERE date = ?
-  `;
-  const expParams = [date];
-
+  // LIVE expenses from expenses table
+  let totalExpenses = 0;
   if (branch_id) {
-    expQuery += ` AND branch_id = ?`;
-    expParams.push(branch_id);
+    totalExpenses = await getLiveExpenses(date, branch_id);
+  } else {
+    const [expRows] = await db.promise().execute(
+      `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date = ?`,
+      [date]
+    );
+    totalExpenses = parseFloat(expRows[0].total) || 0;
   }
 
-  const [expRows] = await db.promise().execute(expQuery, expParams);
+  const totalCogs = parseFloat(ops.totalCogs);
+  const totalActualRevenue = parseFloat(ops.totalActualRevenue);
 
   return {
     totalRevenue: parseFloat(ops.totalRevenue),
-    totalActualRevenue: parseFloat(ops.totalActualRevenue),
-    totalCost: parseFloat(ops.totalCost),
-    totalExpenses: parseFloat(expRows[0].totalExpenses),
-    totalProfit: parseFloat(ops.totalProfit)
+    totalActualRevenue: totalActualRevenue,
+    totalCogs: totalCogs,                          // COGS = meat cost only
+    totalCost: totalExpenses,                      // ✅ TOTAL COST = expenses only
+    totalExpenses: totalExpenses,                  // Same as totalCost
+    totalProfit: totalActualRevenue - totalCogs - totalExpenses  // Recalculated live
   };
 };
 
-// CREATE OR UPDATE DAILY ENTRY — FIXED
+// CREATE OR UPDATE DAILY ENTRY
 exports.createOrUpdateDailyOperation = async (req, res) => {
   try {
     const {
@@ -91,20 +103,12 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
 
     const sold_kg = opening + supply - waste - closing;
     const expected_revenue = sold_kg * sellPrice;
-    const actual_revenue = cash + mpesa;                          // ✅ CALCULATED
-    const cogs = sold_kg * cost;
-    const revenue_variance = expected_revenue - actual_revenue;   // ✅ CALCULATED
+    const actual_revenue = cash + mpesa;
+    const cogs = sold_kg * cost;                    // COGS = meat cost
+    const revenue_variance = expected_revenue - actual_revenue;
 
-    let total_expenses = 0;
-    try {
-      const [expRows] = await db.promise().execute(
-        `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date = ? AND branch_id = ?`,
-        [date, branch_id]
-      );
-      total_expenses = parseFloat(expRows[0].total) || 0;
-    } catch (e) {
-      total_expenses = 0;
-    }
+    // LIVE expenses from expenses table
+    const total_expenses = await getLiveExpenses(date, branch_id);
 
     const profit = actual_revenue - cogs - total_expenses;
     const expected_profit = expected_revenue - cogs - total_expenses;
@@ -116,7 +120,6 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
       });
     }
 
-    // ✅ FIXED: Added actual_revenue and revenue_variance to INSERT/UPDATE
     const query = `
       INSERT INTO daily_entries 
         (branch_id, date, opening_stock_kg, supply_kg, waste_kg, sold_kg,
@@ -157,7 +160,8 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
         sold_kg, 
         expected_revenue, 
         actual_revenue, 
-        cogs, 
+        cogs,                         // COGS = meat cost
+        totalCost: total_expenses,    // ✅ TOTAL COST = expenses only
         total_expenses, 
         profit,
         expected_profit,
@@ -203,17 +207,8 @@ exports.getLastEntry = async (req, res) => {
     const actualRevenue = paymentCash + paymentMpesa;
     const cogs = (parseFloat(entry.sold_kg) || 0) * (parseFloat(entry.cost_per_kg) || 0);
 
-    // Fetch LIVE expenses from expenses table
-    let totalExpenses = 0;
-    try {
-      const [expRows] = await db.promise().execute(
-        `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date = ? AND branch_id = ?`,
-        [entry.date, entry.branch_id]
-      );
-      totalExpenses = parseFloat(expRows[0].total) || 0;
-    } catch (e) {
-      totalExpenses = 0;
-    }
+    // LIVE expenses from expenses table (not stale daily_entries.expenses)
+    const totalExpenses = await getLiveExpenses(entry.date, entry.branch_id);
 
     const actualProfit = actualRevenue - cogs - totalExpenses;
     const expectedProfit = expectedRevenue - cogs - totalExpenses;
@@ -230,8 +225,9 @@ exports.getLastEntry = async (req, res) => {
       revenueVariance,
       paymentCash,
       paymentMpesa,
-      cogs,
-      totalExpenses,        // ✅ ADDED: live expenses
+      cogs,                        // COGS = meat cost
+      totalCost: totalExpenses,   // ✅ TOTAL COST = expenses only (LIVE)
+      totalExpenses,               // Same as totalCost
       totalRevenue: actualRevenue,
       netMargin: actualProfit,
     };
@@ -269,17 +265,8 @@ exports.getEntryByDate = async (req, res) => {
     const actualRevenue = paymentCash + paymentMpesa;
     const cogs = (parseFloat(entry.sold_kg) || 0) * (parseFloat(entry.cost_per_kg) || 0);
 
-    // Fetch LIVE expenses
-    let totalExpenses = 0;
-    try {
-      const [expRows] = await db.promise().execute(
-        `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date = ? AND branch_id = ?`,
-        [date, branch_id]
-      );
-      totalExpenses = parseFloat(expRows[0].total) || 0;
-    } catch (e) {
-      totalExpenses = 0;
-    }
+    // LIVE expenses
+    const totalExpenses = await getLiveExpenses(date, branch_id);
 
     const actualProfit = actualRevenue - cogs - totalExpenses;
     const expectedProfit = expectedRevenue - cogs - totalExpenses;
@@ -297,6 +284,7 @@ exports.getEntryByDate = async (req, res) => {
       paymentCash,
       paymentMpesa,
       cogs,
+      totalCost: totalExpenses,     // ✅ TOTAL COST = expenses only (LIVE)
       totalExpenses,
       totalRevenue: actualRevenue,
       netMargin: actualProfit,
@@ -309,7 +297,7 @@ exports.getEntryByDate = async (req, res) => {
   }
 };
 
-// GET DATE TOTALS
+// GET DATE TOTALS — FIXED
 exports.getDateTotals = async (req, res) => {
   try {
     const { branch_id } = req.query;
