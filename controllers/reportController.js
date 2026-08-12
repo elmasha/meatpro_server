@@ -1,8 +1,8 @@
 const db = require("../config/db");
 const redis = require('../config/redis');
 
-// ===== REPORTS CONTROLLER — CORRECTED =====
-// All report endpoints now include live expenses from the expenses table
+// ===== REPORTS CONTROLLER — OPTION B =====
+// Net Profit = Revenue - Expenses only (COGS is NOT subtracted)
 
 // Helper: get live expenses for a date range
 const getLiveExpenses = async (startDate, endDate, branch_id) => {
@@ -22,7 +22,7 @@ const getLiveExpenses = async (startDate, endDate, branch_id) => {
   return parseFloat(rows[0].total) || 0;
 };
 
-// GET /reports/last-entry — FIXED: includes live expenses
+// GET /reports/last-entry — OPTION B: profit = revenue - expenses
 exports.getLastEntryReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
@@ -51,8 +51,9 @@ exports.getLastEntryReport = async (req, res) => {
     // Fetch LIVE expenses
     const totalExpenses = await getLiveExpenses(entry.date, entry.date, entry.branch_id);
 
-    const actualProfit = actualRevenue - cogs - totalExpenses;
-    const expectedProfit = expectedRevenue - cogs - totalExpenses;
+    // ✅ OPTION B: Profit = Revenue - Expenses only (COGS NOT subtracted)
+    const actualProfit = actualRevenue - totalExpenses;
+    const expectedProfit = expectedRevenue - totalExpenses;
     const revenueVariance = expectedRevenue - actualRevenue;
     const marginPct = actualRevenue > 0 ? ((actualProfit / actualRevenue) * 100).toFixed(1) : 0;
 
@@ -60,9 +61,10 @@ exports.getLastEntryReport = async (req, res) => {
       ...entry,
       expectedRevenue,
       actualRevenue,
-      totalCost: cogs,
-      totalExpenses,        // ADDED: live expenses
-      actualProfit,
+      cogs,                          // COGS shown for info but NOT subtracted from profit
+      totalCost: totalExpenses,       // ✅ Total Cost = expenses only
+      totalExpenses,                 // Live expenses
+      actualProfit,                  // ✅ Revenue - Expenses only
       expectedProfit,
       expectedMargin: expectedRevenue > 0 ? ((expectedProfit / expectedRevenue) * 100).toFixed(1) : 0,
       revenueVariance,
@@ -77,7 +79,7 @@ exports.getLastEntryReport = async (req, res) => {
   }
 };
 
-// GET /reports/last-7-days — FIXED: includes live expenses
+// GET /reports/last-7-days — OPTION B: profit = revenue - expenses
 exports.getLast7DaysReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
@@ -89,7 +91,7 @@ exports.getLast7DaysReport = async (req, res) => {
         COALESCE(SUM(revenue), 0) as totalRevenue,
         COALESCE(SUM(actual_revenue), 0) as totalActualRevenue,
         COALESCE(SUM(payment_cash + payment_mpesa), 0) as totalPayments,
-        COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCost,
+        COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCogs,
         COALESCE(SUM(profit), 0) as totalProfit,
         COALESCE(SUM(sold_kg), 0) as totalSold,
         COALESCE(SUM(waste_kg), 0) as totalWaste
@@ -110,15 +112,18 @@ exports.getLast7DaysReport = async (req, res) => {
     const totalExpenses = await getLiveExpenses(startDate, endDate, branch_id);
 
     const totalActualRevenue = parseFloat(ops.totalPayments) || parseFloat(ops.totalActualRevenue) || 0;
-    const totalCost = parseFloat(ops.totalCost) || 0;
-    const actualProfit = totalActualRevenue - totalCost - totalExpenses;
+    const totalCogs = parseFloat(ops.totalCogs) || 0;
+
+    // ✅ OPTION B: Profit = Revenue - Expenses only (COGS NOT subtracted)
+    const actualProfit = totalActualRevenue - totalExpenses;
 
     res.status(200).json({
       totalRevenue: parseFloat(ops.totalRevenue) || 0,
       totalActualRevenue,
-      totalCost,
-      totalExpenses,        // ADDED
-      totalProfit: actualProfit,
+      cogs: totalCogs,                        // COGS for info
+      totalCost: totalExpenses,               // ✅ Total Cost = expenses only
+      totalExpenses,
+      totalProfit: actualProfit,              // ✅ Profit = Revenue - Expenses
       totalSold: parseFloat(ops.totalSold) || 0,
       totalWaste: parseFloat(ops.totalWaste) || 0,
       margin: actualProfit,
@@ -132,7 +137,7 @@ exports.getLast7DaysReport = async (req, res) => {
   }
 };
 
-// GET /reports/month-to-date — FIXED: includes live expenses
+// GET /reports/month-to-date — OPTION B: profit = revenue - expenses
 exports.getMonthToDateReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
@@ -145,7 +150,7 @@ exports.getMonthToDateReport = async (req, res) => {
         COALESCE(SUM(revenue), 0) as totalRevenue,
         COALESCE(SUM(actual_revenue), 0) as totalActualRevenue,
         COALESCE(SUM(payment_cash + payment_mpesa), 0) as totalPayments,
-        COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCost,
+        COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCogs,
         COALESCE(SUM(profit), 0) as totalProfit,
         COALESCE(SUM(sold_kg), 0) as totalSold,
         COALESCE(SUM(waste_kg), 0) as totalWaste
@@ -166,15 +171,18 @@ exports.getMonthToDateReport = async (req, res) => {
     const totalExpenses = await getLiveExpenses(startDate, endDate, branch_id);
 
     const totalActualRevenue = parseFloat(ops.totalPayments) || parseFloat(ops.totalActualRevenue) || 0;
-    const totalCost = parseFloat(ops.totalCost) || 0;
-    const actualProfit = totalActualRevenue - totalCost - totalExpenses;
+    const totalCogs = parseFloat(ops.totalCogs) || 0;
+
+    // ✅ OPTION B: Profit = Revenue - Expenses only (COGS NOT subtracted)
+    const actualProfit = totalActualRevenue - totalExpenses;
 
     res.status(200).json({
       totalRevenue: parseFloat(ops.totalRevenue) || 0,
       totalActualRevenue,
-      totalCost,
-      totalExpenses,        // ADDED
-      totalProfit: actualProfit,
+      cogs: totalCogs,                        // COGS for info
+      totalCost: totalExpenses,               // ✅ Total Cost = expenses only
+      totalExpenses,
+      totalProfit: actualProfit,              // ✅ Profit = Revenue - Expenses
       totalSold: parseFloat(ops.totalSold) || 0,
       totalWaste: parseFloat(ops.totalWaste) || 0,
       margin: actualProfit,
@@ -188,7 +196,7 @@ exports.getMonthToDateReport = async (req, res) => {
   }
 };
 
-// GET /reports/comparative — FIXED: includes live expenses
+// GET /reports/comparative — OPTION B: profit = revenue - expenses
 exports.getComparative = async (req, res) => {
   try {
     const { branch_id } = req.query;
@@ -244,7 +252,7 @@ exports.getComparative = async (req, res) => {
     const [lastRows] = await db.promise().execute(lastQuery, lastParams);
     const lastData = lastRows[0];
 
-    // Calculate profits with live expenses
+    // ✅ OPTION B: Profit = Revenue - Expenses only (COGS NOT subtracted)
     const thisActualProfit = parseFloat(thisData.actual_revenue) - thisMonthExpenses;
     const thisExpectedProfit = parseFloat(thisData.expected_revenue) - thisMonthExpenses;
     const lastActualProfit = parseFloat(lastData.actual_revenue) - lastMonthExpenses;
@@ -292,7 +300,7 @@ function calculateChange(oldVal, newVal) {
   return ((newV - old) / old * 100).toFixed(1);
 }
 
-// GET /reports/profitability
+// GET /reports/profitability — OPTION B: profit = revenue - expenses
 exports.getProfitability = async (req, res) => {
   try {
     const { branch_id, days = 30 } = req.query;
@@ -336,14 +344,15 @@ exports.getProfitability = async (req, res) => {
       const actualRevenue = parseFloat(row.payment_cash || 0) + parseFloat(row.payment_mpesa || 0);
       const cogs = parseFloat(row.cogs) || 0;
 
+      // ✅ OPTION B: Profit = Revenue - Expenses only
       daily.push({
         date: row.date,
         expected_revenue: parseFloat(row.expected_revenue) || 0,
         actual_revenue: actualRevenue,
         cogs,
         expenses,
-        actual_profit: actualRevenue - cogs - expenses,
-        expected_profit: (parseFloat(row.expected_revenue) || 0) - cogs - expenses,
+        actual_profit: actualRevenue - expenses,           // ✅ Revenue - Expenses
+        expected_profit: (parseFloat(row.expected_revenue) || 0) - expenses,
         sold_kg: parseFloat(row.sold_kg) || 0,
         waste_kg: parseFloat(row.waste_kg) || 0,
         payment_cash: parseFloat(row.payment_cash) || 0,
@@ -510,7 +519,7 @@ exports.getPaymentMix = async (req, res) => {
   }
 };
 
-// GET /reports/expense-breakdown-
+// GET /reports/expense-breakdown
 exports.getExpenseBreakdown = async (req, res) => {
   try {
     const { branch_id, days = 30 } = req.query;

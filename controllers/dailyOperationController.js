@@ -1,315 +1,304 @@
 const db = require("../config/db");
 const redis = require('../config/redis');
 
-// Helper: invalidate cache keys related to reports/stock
+const fmt = (n) => { const v = parseFloat(n); return isNaN(v) ? 0 : Math.round(v * 100) / 100; };
+
 const invalidateDailyCache = async (branch_id, date) => {
   const keys = [
     `stock:current:${branch_id || 'all'}`,
-    `daily:last-entry:${branch_id || 'all'}`,
+    `report:last-entry:${branch_id || 'all'}`,
     `report:last-7-days:${branch_id || 'all'}`,
-    `report:month-to-date:${branch_id || 'all'}`,
-    `expenses:${date}:${branch_id}`
+    `report:month-to-date:${branch_id || 'all'}`
   ];
-
-  for (const key of keys) {
-    await redis.del(key);
-  }
+  for (const key of keys) { await redis.del(key); }
 };
 
-// ===== LIVE EXPENSES HELPER =====
-const getLiveExpenses = async (date, branch_id) => {
-  const [expRows] = await db.promise().execute(
-    `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date = ? AND branch_id = ?`,
-    [date, branch_id]
+const verifyBranchAccess = async (firebase_uid, branch_id) => {
+  const [rows] = await db.promise().execute(
+    `SELECT 1 FROM branches br
+      JOIN businesses b ON br.business_id = b.id
+      WHERE br.id = ? AND (b.firebase_uid = ? OR br.manager_uid = ?)
+      LIMIT 1`,
+    [branch_id, firebase_uid, firebase_uid]
   );
-  return parseFloat(expRows[0].total) || 0;
+  return rows.length > 0;
 };
 
-// ===== SINGLE DATE TOTALS HELPER =====
-const calculateDateTotals = async (date, branch_id = null) => {
-  // Operations data
-  let opsQuery = `
-    SELECT
-      COALESCE(SUM(revenue), 0) as totalRevenue,
-      COALESCE(SUM(payment_cash + payment_mpesa), 0) as totalActualRevenue,
+// ─── HELPERS ────────────────────────────────────────────────────────────────
+
+const getDailyExpenses = async (connection, branch_id, date) => {
+  const [expRows] = await connection.execute(
+    `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE branch_id = ? AND date = ?`,
+    [branch_id, date]
+  );
+  return parseFloat(expRows[0]?.total) || 0;
+};
+
+const calculateDateTotals = async (connection, branch_id, date) => {
+  const [opsRows] = await connection.execute(
+    `SELECT 
+      COALESCE(SUM(actual_revenue), 0) as totalActualRevenue,
+      COALESCE(SUM(expected_revenue), 0) as totalExpectedRevenue,
       COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCogs,
-      COALESCE(SUM(profit), 0) as totalProfit
+      COALESCE(SUM(sold_kg), 0) as totalSoldKg,
+      COALESCE(SUM(opening_stock_kg), 0) as totalOpeningStock,
+      COALESCE(SUM(closing_stock_kg), 0) as totalClosingStock,
+      COUNT(*) as entryCount
     FROM daily_entries 
-    WHERE date = ?
-  `;
-  const opsParams = [date];
+    WHERE branch_id = ? AND date = ?`,
+    [branch_id, date]
+  );
 
-  if (branch_id) {
-    opsQuery += ` AND branch_id = ?`;
-    opsParams.push(branch_id);
-  }
-
-  const [opsRows] = await db.promise().execute(opsQuery, opsParams);
   const ops = opsRows[0];
+  const totalActualRevenue = parseFloat(ops.totalActualRevenue) || 0;
+  const totalExpectedRevenue = parseFloat(ops.totalExpectedRevenue) || 0;
+  const totalCogs = parseFloat(ops.totalCogs) || 0;
+  const totalExpenses = await getDailyExpenses(connection, branch_id, date);
 
-  // LIVE expenses from expenses table
-  let totalExpenses = 0;
-  if (branch_id) {
-    totalExpenses = await getLiveExpenses(date, branch_id);
-  } else {
-    const [expRows] = await db.promise().execute(
-      `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date = ?`,
-      [date]
-    );
-    totalExpenses = parseFloat(expRows[0].total) || 0;
-  }
-
-  const totalCogs = parseFloat(ops.totalCogs);
-  const totalActualRevenue = parseFloat(ops.totalActualRevenue);
+  // ✅ OPTION B: Profit = Revenue - Expenses only (COGS NOT subtracted)
+  const totalProfit = totalActualRevenue - totalExpenses;
+  const totalExpectedProfit = totalExpectedRevenue - totalExpenses;
 
   return {
-    totalRevenue: parseFloat(ops.totalRevenue),
-    totalActualRevenue: totalActualRevenue,
-    totalCogs: totalCogs,                          // COGS = meat cost
-    totalCost: totalExpenses,                      // ✅ TOTAL COST = expenses only
-    totalExpenses: totalExpenses,                  // Same as totalCost
-    totalProfit: totalActualRevenue - totalCogs - totalExpenses  // Recalculated live
+    totalActualRevenue: fmt(totalActualRevenue),
+    totalExpectedRevenue: fmt(totalExpectedRevenue),
+    totalCogs: fmt(totalCogs),
+    totalCost: fmt(totalExpenses),
+    totalExpenses: fmt(totalExpenses),
+    totalProfit: fmt(totalProfit),
+    totalExpectedProfit: fmt(totalExpectedProfit),
+    totalSoldKg: fmt(parseFloat(ops.totalSoldKg) || 0),
+    totalOpeningStock: fmt(parseFloat(ops.totalOpeningStock) || 0),
+    totalClosingStock: fmt(parseFloat(ops.totalClosingStock) || 0),
+    entryCount: parseInt(ops.entryCount) || 0
   };
 };
 
-// CREATE OR UPDATE DAILY ENTRY
+// ─── DAILY OPERATIONS ───────────────────────────────────────────────────────
+
 exports.createOrUpdateDailyOperation = async (req, res) => {
   try {
-    const {
-      branch_id,
-      date,
-      opening_stock_kg,
-      supply_kg,
-      waste_kg,
-      closing_stock_kg,
-      cost_per_kg,
-      selling_price_per_kg,
-      payment_cash,
-      payment_mpesa
-    } = req.body;
+    const { branch_id, date, opening_stock_kg, supply_kg, sold_kg, waste_kg, cost_per_kg, selling_price_per_kg, payment_cash, payment_mpesa } = req.body;
+    const firebase_uid = req.firebase_uid;
 
     if (!date || !branch_id) {
       return res.status(400).json({ message: "Date and branch_id are required" });
+    }
+
+    const hasAccess = await verifyBranchAccess(firebase_uid, branch_id);
+    if (!hasAccess) {
+      return res.status(403).json({ message: "Forbidden — you do not own this branch" });
     }
 
     const opening = parseFloat(opening_stock_kg) || 0;
     const supply = parseFloat(supply_kg) || 0;
+    const sold = parseFloat(sold_kg) || 0;
     const waste = parseFloat(waste_kg) || 0;
-    const closing = parseFloat(closing_stock_kg) || 0;
     const cost = parseFloat(cost_per_kg) || 0;
-    const sellPrice = parseFloat(selling_price_per_kg) || 0;
+    const price = parseFloat(selling_price_per_kg) || 0;
     const cash = parseFloat(payment_cash) || 0;
     const mpesa = parseFloat(payment_mpesa) || 0;
 
-    const sold_kg = opening + supply - waste - closing;
-    const expected_revenue = sold_kg * sellPrice;
-    const actual_revenue = cash + mpesa;
-    const cogs = sold_kg * cost;                    // COGS = meat cost
-    const revenue_variance = expected_revenue - actual_revenue;
+    const closing = opening + supply - sold - waste;
+    const expectedRevenue = sold * price;
+    const actualRevenue = cash + mpesa;
+    const revenueVariance = expectedRevenue - actualRevenue;
+    const cogs = sold * cost;
 
-    // LIVE expenses from expenses table
-    const total_expenses = await getLiveExpenses(date, branch_id);
+    // Get live expenses
+    const connection = await db.promise().getConnection();
+    try {
+      const totalExpenses = await getDailyExpenses(connection, branch_id, date);
 
-    const profit = actual_revenue - cogs - total_expenses;
-    const expected_profit = expected_revenue - cogs - total_expenses;
+      // ✅ OPTION B: Profit = Revenue - Expenses only (COGS NOT subtracted)
+      const profit = actualRevenue - totalExpenses;
+      const expectedProfit = expectedRevenue - totalExpenses;
 
-    if (sold_kg < 0) {
-      return res.status(400).json({ 
-        message: "Invalid stock figures: sold kg cannot be negative",
-        sold_kg
-      });
-    }
+      const [existing] = await connection.execute(
+        `SELECT id FROM daily_entries WHERE branch_id = ? AND date = ?`,
+        [branch_id, date]
+      );
 
-    const query = `
-      INSERT INTO daily_entries 
-        (branch_id, date, opening_stock_kg, supply_kg, waste_kg, sold_kg,
-         closing_stock_kg, cost_per_kg, selling_price_per_kg, revenue,
-         actual_revenue, revenue_variance, expenses, profit, payment_cash, payment_mpesa)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        opening_stock_kg = VALUES(opening_stock_kg),
-        supply_kg = VALUES(supply_kg),
-        waste_kg = VALUES(waste_kg),
-        sold_kg = VALUES(sold_kg),
-        closing_stock_kg = VALUES(closing_stock_kg),
-        cost_per_kg = VALUES(cost_per_kg),
-        selling_price_per_kg = VALUES(selling_price_per_kg),
-        revenue = VALUES(revenue),
-        actual_revenue = VALUES(actual_revenue),
-        revenue_variance = VALUES(revenue_variance),
-        expenses = VALUES(expenses),
-        profit = VALUES(profit),
-        payment_cash = VALUES(payment_cash),
-        payment_mpesa = VALUES(payment_mpesa)
-    `;
-
-    await db.promise().execute(query, [
-      branch_id, date, opening, supply, waste, sold_kg,
-      closing, cost, sellPrice, expected_revenue,
-      actual_revenue, revenue_variance, total_expenses, profit,
-      cash, mpesa
-    ]);
-
-    await invalidateDailyCache(branch_id, date);
-
-    res.status(200).json({
-      message: "Daily operation saved successfully",
-      data: { 
-        branch_id, 
-        date, 
-        sold_kg, 
-        expected_revenue, 
-        actual_revenue, 
-        cogs,                         // COGS = meat cost
-        totalCost: total_expenses,    // ✅ TOTAL COST = expenses only
-        total_expenses, 
-        profit,
-        expected_profit,
-        revenue_variance
+      if (existing.length > 0) {
+        await connection.execute(
+          `UPDATE daily_entries SET
+            opening_stock_kg = ?, supply_kg = ?, sold_kg = ?, waste_kg = ?,
+            cost_per_kg = ?, selling_price_per_kg = ?, revenue = ?,
+            actual_revenue = ?, payment_cash = ?, payment_mpesa = ?,
+            profit = ?, expected_profit = ?, revenue_variance = ?,
+            closing_stock_kg = ?, expenses = ?
+          WHERE branch_id = ? AND date = ?`,
+          [opening, supply, sold, waste, cost, price, expectedRevenue,
+           actualRevenue, cash, mpesa, profit, expectedProfit, revenueVariance,
+           closing, totalExpenses, branch_id, date]
+        );
+      } else {
+        await connection.execute(
+          `INSERT INTO daily_entries
+            (branch_id, date, opening_stock_kg, supply_kg, sold_kg, waste_kg,
+             cost_per_kg, selling_price_per_kg, revenue, actual_revenue,
+             payment_cash, payment_mpesa, profit, expected_profit,
+             revenue_variance, closing_stock_kg, expenses)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [branch_id, date, opening, supply, sold, waste, cost, price,
+           expectedRevenue, actualRevenue, cash, mpesa, profit, expectedProfit,
+           revenueVariance, closing, totalExpenses]
+        );
       }
-    });
 
+      await invalidateDailyCache(branch_id, date);
+
+      res.status(200).json({
+        message: existing.length > 0 ? "Entry updated" : "Entry created",
+        data: {
+          date, opening_stock_kg: opening, supply_kg: supply, sold_kg: sold,
+          waste_kg: waste, cost_per_kg: cost, selling_price_per_kg: price,
+          expectedRevenue, actualRevenue, payment_cash: cash, payment_mpesa: mpesa,
+          cogs, totalCost: totalExpenses, totalExpenses, profit, expectedProfit,
+          revenueVariance, closing_stock_kg: closing
+        }
+      });
+    } finally {
+      connection.release();
+    }
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// GET LAST ENTRY — FIXED
 exports.getLastEntry = async (req, res) => {
   try {
     const { branch_id } = req.query;
-    const cacheKey = `daily:last-entry:${branch_id || 'all'}`;
 
+    if (!branch_id) {
+      return res.status(400).json({ message: "branch_id is required" });
+    }
+
+    const cacheKey = `daily:last:${branch_id}`;
     const cached = await redis.get(cacheKey);
-    if (cached) {
-      return res.status(200).json(JSON.parse(cached));
+    if (cached) return res.status(200).json(JSON.parse(cached));
+
+    const connection = await db.promise().getConnection();
+    try {
+      const [rows] = await connection.execute(
+        `SELECT * FROM daily_entries WHERE branch_id = ? ORDER BY date DESC LIMIT 1`,
+        [branch_id]
+      );
+
+      if (rows.length === 0) {
+        return res.status(404).json({ message: "No entries found" });
+      }
+
+      const entry = rows[0];
+      const date = entry.date;
+      const liveExpenses = await getDailyExpenses(connection, branch_id, date);
+      const cogs = parseFloat(entry.sold_kg) * parseFloat(entry.cost_per_kg) || 0;
+      const actualRevenue = parseFloat(entry.actual_revenue) || 0;
+
+      // ✅ OPTION B: Profit = Revenue - Expenses only
+      const actualProfit = actualRevenue - liveExpenses;
+      const marginPct = actualRevenue > 0 ? ((actualProfit / actualRevenue) * 100).toFixed(1) : 0;
+
+      const result = {
+        ...entry,
+        actualRevenue: fmt(actualRevenue),
+        cogs: fmt(cogs),
+        totalCost: fmt(liveExpenses),
+        totalExpenses: fmt(liveExpenses),
+        actualProfit: fmt(actualProfit),
+        marginPct: fmt(marginPct)
+      };
+
+      await redis.setEx(cacheKey, 300, JSON.stringify(result));
+      res.status(200).json(result);
+    } finally {
+      connection.release();
     }
-
-    let query = `SELECT * FROM daily_entries ORDER BY date DESC, id DESC LIMIT 1`;
-    const params = [];
-
-    if (branch_id) {
-      query = `SELECT * FROM daily_entries WHERE branch_id = ? ORDER BY date DESC, id DESC LIMIT 1`;
-      params.push(branch_id);
-    }
-
-    const [rows] = await db.promise().execute(query, params);
-
-    if (rows.length === 0) {
-      return res.status(404).json({ message: "No entries found" });
-    }
-
-    const entry = rows[0];
-
-    const expectedRevenue = parseFloat(entry.revenue) || 0;
-    const paymentCash = parseFloat(entry.payment_cash) || 0;
-    const paymentMpesa = parseFloat(entry.payment_mpesa) || 0;
-    const actualRevenue = paymentCash + paymentMpesa;
-    const cogs = (parseFloat(entry.sold_kg) || 0) * (parseFloat(entry.cost_per_kg) || 0);
-
-    // LIVE expenses from expenses table (not stale daily_entries.expenses)
-    const totalExpenses = await getLiveExpenses(entry.date, entry.branch_id);
-
-    const actualProfit = actualRevenue - cogs - totalExpenses;
-    const expectedProfit = expectedRevenue - cogs - totalExpenses;
-    const revenueVariance = expectedRevenue - actualRevenue;
-    const marginPct = actualRevenue > 0 ? ((actualProfit / actualRevenue) * 100).toFixed(1) : 0;
-
-    const result = {
-      ...entry,
-      actualRevenue,
-      actualProfit,
-      marginPct: parseFloat(marginPct),
-      expectedRevenue,
-      expectedProfit,
-      revenueVariance,
-      paymentCash,
-      paymentMpesa,
-      cogs,                        // COGS = meat cost
-      totalCost: totalExpenses,   // ✅ TOTAL COST = live expenses
-      totalExpenses,               // Same as totalCost
-      totalRevenue: actualRevenue,
-      netMargin: actualProfit,
-    };
-
-    await redis.setEx(cacheKey, 300, JSON.stringify(result));
-    res.status(200).json(result);
-
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// GET ENTRY BY DATE — FIXED
 exports.getEntryByDate = async (req, res) => {
   try {
-    const { branch_id } = req.query;
-    const { date } = req.params;
+    const { branch_id, date } = req.query;
 
-    if (!date || !branch_id) {
-      return res.status(400).json({ message: "Date and branch_id are required" });
+    if (!branch_id || !date) {
+      return res.status(400).json({ message: "branch_id and date are required" });
     }
 
-    const query = `SELECT * FROM daily_entries WHERE date = ? AND branch_id = ?`;
-    const [rows] = await db.promise().execute(query, [date, branch_id]);
+    const connection = await db.promise().getConnection();
+    try {
+      const [rows] = await connection.execute(
+        `SELECT * FROM daily_entries WHERE branch_id = ? AND date = ?`,
+        [branch_id, date]
+      );
 
-    if (rows.length === 0) {
-      return res.status(404).json({ message: "No entry found for this date" });
+      if (rows.length === 0) {
+        return res.status(404).json({ message: "No entry found for this date" });
+      }
+
+      const entry = rows[0];
+      const liveExpenses = await getDailyExpenses(connection, branch_id, date);
+      const cogs = parseFloat(entry.sold_kg) * parseFloat(entry.cost_per_kg) || 0;
+      const actualRevenue = parseFloat(entry.actual_revenue) || 0;
+
+      // ✅ OPTION B: Profit = Revenue - Expenses only
+      const actualProfit = actualRevenue - liveExpenses;
+
+      res.status(200).json({
+        ...entry,
+        actualRevenue: fmt(actualRevenue),
+        cogs: fmt(cogs),
+        totalCost: fmt(liveExpenses),
+        totalExpenses: fmt(liveExpenses),
+        actualProfit: fmt(actualProfit)
+      });
+    } finally {
+      connection.release();
     }
-
-    const entry = rows[0];
-
-    const expectedRevenue = parseFloat(entry.revenue) || 0;
-    const paymentCash = parseFloat(entry.payment_cash) || 0;
-    const paymentMpesa = parseFloat(entry.payment_mpesa) || 0;
-    const actualRevenue = paymentCash + paymentMpesa;
-    const cogs = (parseFloat(entry.sold_kg) || 0) * (parseFloat(entry.cost_per_kg) || 0);
-
-    // LIVE expenses
-    const totalExpenses = await getLiveExpenses(date, branch_id);
-
-    const actualProfit = actualRevenue - cogs - totalExpenses;
-    const expectedProfit = expectedRevenue - cogs - totalExpenses;
-    const revenueVariance = expectedRevenue - actualRevenue;
-    const marginPct = actualRevenue > 0 ? ((actualProfit / actualRevenue) * 100).toFixed(1) : 0;
-
-    const result = {
-      ...entry,
-      actualRevenue,
-      actualProfit,
-      marginPct: parseFloat(marginPct),
-      expectedRevenue,
-      expectedProfit,
-      revenueVariance,
-      paymentCash,
-      paymentMpesa,
-      cogs,
-      totalCost: totalExpenses,     // ✅ TOTAL COST = live expenses
-      totalExpenses,
-      totalRevenue: actualRevenue,
-      netMargin: actualProfit,
-    };
-
-    res.status(200).json(result);
-
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// GET DATE TOTALS — FIXED
-exports.getDateTotals = async (req, res) => {
+exports.getDailyOperationsByDateRange = async (req, res) => {
   try {
-    const { branch_id } = req.query;
-    const { date } = req.params;
+    const { branch_id, start_date, end_date } = req.query;
 
-    if (!date || !branch_id) {
-      return res.status(400).json({ message: "Date and branch_id are required" });
+    if (!branch_id || !start_date || !end_date) {
+      return res.status(400).json({ message: "branch_id, start_date, and end_date are required" });
     }
 
-    const totals = await calculateDateTotals(date, branch_id);
-    res.status(200).json(totals);
+    const connection = await db.promise().getConnection();
+    try {
+      const [rows] = await connection.execute(
+        `SELECT * FROM daily_entries WHERE branch_id = ? AND date BETWEEN ? AND ? ORDER BY date DESC`,
+        [branch_id, start_date, end_date]
+      );
 
+      const results = [];
+      for (const entry of rows) {
+        const liveExpenses = await getDailyExpenses(connection, branch_id, entry.date);
+        const cogs = parseFloat(entry.sold_kg) * parseFloat(entry.cost_per_kg) || 0;
+        const actualRevenue = parseFloat(entry.actual_revenue) || 0;
+
+        // ✅ OPTION B: Profit = Revenue - Expenses only
+        const actualProfit = actualRevenue - liveExpenses;
+
+        results.push({
+          ...entry,
+          cogs: fmt(cogs),
+          totalCost: fmt(liveExpenses),
+          totalExpenses: fmt(liveExpenses),
+          actualProfit: fmt(actualProfit)
+        });
+      }
+
+      res.status(200).json(results);
+    } finally {
+      connection.release();
+    }
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
