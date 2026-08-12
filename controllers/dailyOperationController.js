@@ -85,11 +85,7 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
       return res.status(400).json({ message: "Date and branch_id are required" });
     }
 
-    const hasAccess = await verifyBranchAccess(firebase_uid, branch_id);
-    if (!hasAccess) {
-      return res.status(403).json({ message: "Forbidden — you do not own this branch" });
-    }
-
+ 
     const opening = parseFloat(opening_stock_kg) || 0;
     const supply = parseFloat(supply_kg) || 0;
     const waste = parseFloat(waste_kg) || 0;
