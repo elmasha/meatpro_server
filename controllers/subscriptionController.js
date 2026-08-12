@@ -2,6 +2,32 @@ const db = require('../config/db');
 const redis = require('../config/redis');
 const request = require('request');
 const moment = require('moment');
+const fs = require('fs');
+const path = require('path');
+
+// ── File Logger Helper ───────────────────────────────────────────────
+function fileLog(label, data) {
+  const logPath = path.join(__dirname, '..', '..', 'logs', 'mpesa-callback.log');
+  const timestamp = new Date().toISOString();
+  const entry = `[${timestamp}] ${label}:
+${typeof data === 'string' ? data : JSON.stringify(data, null, 2)}
+${'='.repeat(60)}
+`;
+
+  try {
+    // Ensure logs directory exists
+    const logsDir = path.dirname(logPath);
+    if (!fs.existsSync(logsDir)) {
+      fs.mkdirSync(logsDir, { recursive: true });
+    }
+    fs.appendFileSync(logPath, entry);
+  } catch (err) {
+    console.error('File log error:', err.message);
+  }
+
+  // Also log to console
+  console.log(entry);
+}
 
 // ── M-Pesa Helper ────────────────────────────────────────────────────
 async function getMpesaToken() {
@@ -67,25 +93,26 @@ function getMpesaTimestamp() {
 // ── Helper: Log table data for debugging ──────────────────────────────
 async function logTableData(connection, label, userId, checkoutRequestId) {
   try {
-    console.log(`\n========== ${label} ==========`);
+    const section = `========== ${label} ==========`;
+    fileLog('TABLE LOG HEADER', section);
 
     // Log users table
     const [users] = await connection.query('SELECT id, firebase_uid, name, phone, subscription, subscription_status, subscription_expires, mpesa_receipt, payment_date FROM users WHERE id = ?', [userId]);
-    console.log('USERS TABLE:', JSON.stringify(users, null, 2));
+    fileLog('USERS TABLE', users);
 
     // Log payments table
     const [payments] = await connection.query(
       'SELECT id, user_id, amount, phone, mpesa_receipt, checkout_request_id, status, transaction_date, created_at FROM payments WHERE checkout_request_id = ?',
       [checkoutRequestId]
     );
-    console.log('PAYMENTS TABLE:', JSON.stringify(payments, null, 2));
+    fileLog('PAYMENTS TABLE', payments);
 
     // Log subscriptions table
     const [subscriptions] = await connection.query(
       'SELECT id, user_id, plan_id, plan, amount, start_date, end_date, status, payment_reference, mpesa_receipt, created_at FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 3',
       [userId]
     );
-    console.log('SUBSCRIPTIONS TABLE:', JSON.stringify(subscriptions, null, 2));
+    fileLog('SUBSCRIPTIONS TABLE', subscriptions);
 
     // Log daily_entries table (last 3 entries for this user)
     const [dailyEntries] = await connection.query(
@@ -97,7 +124,7 @@ async function logTableData(connection, label, userId, checkoutRequestId) {
        ORDER BY de.created_at DESC LIMIT 3`,
       [userId]
     );
-    console.log('DAILY_ENTRIES TABLE (last 3):', JSON.stringify(dailyEntries, null, 2));
+    fileLog('DAILY_ENTRIES TABLE (last 3)', dailyEntries);
 
     // Log expenses table (last 3 for this user)
     const [expenses] = await connection.query(
@@ -109,11 +136,11 @@ async function logTableData(connection, label, userId, checkoutRequestId) {
        ORDER BY e.created_at DESC LIMIT 3`,
       [userId]
     );
-    console.log('EXPENSES TABLE (last 3):', JSON.stringify(expenses, null, 2));
+    fileLog('EXPENSES TABLE (last 3)', expenses);
 
-    console.log(`========== END ${label} ==========\n`);
+    fileLog('TABLE LOG FOOTER', `========== END ${label} ==========`);
   } catch (err) {
-    console.error(`Error logging table data (${label}):`, err.message);
+    fileLog('ERROR logging table data', { label, error: err.message, stack: err.stack });
   }
 }
 
@@ -272,7 +299,6 @@ exports.initiatePayment = async (req, res) => {
     );
 
     const token = await getMpesaToken();
-    // FIXED: Use Nairobi timezone
     const timestamp = getMpesaTimestamp();
     const shortcode = process.env.PROD_SHORTCODE_DEV;
     const passkey = process.env.PROD_PASSKEY_DEV;
@@ -332,6 +358,12 @@ exports.initiatePayment = async (req, res) => {
 
 // ── POST /api/subscriptions/callback ─────────────────────────────────
 exports.mpesaCallback = async (req, res) => {
+  fileLog('CALLBACK RECEIVED', {
+    timestamp: new Date().toISOString(),
+    headers: req.headers,
+    body: req.body
+  });
+
   const connection = await db.promise().getConnection();
   try {
     await connection.beginTransaction();
@@ -340,12 +372,11 @@ exports.mpesaCallback = async (req, res) => {
     const result = Body.stkCallback;
     const checkoutRequestId = result.CheckoutRequestID;
 
-    console.log('\n========== M-PESA CALLBACK RECEIVED ==========');
-    console.log('CheckoutRequestID:', checkoutRequestId);
-    console.log('ResultCode:', result.ResultCode);
-    console.log('ResultDesc:', result.ResultDesc);
-    console.log('Full Callback Body:', JSON.stringify(req.body, null, 2));
-    console.log('========== END CALLBACK HEADER ==========\n');
+    fileLog('CALLBACK PARSED', {
+      CheckoutRequestID: checkoutRequestId,
+      ResultCode: result.ResultCode,
+      ResultDesc: result.ResultDesc
+    });
 
     if (result.ResultCode === 0) {
       const items = result.CallbackMetadata.Item;
@@ -353,10 +384,7 @@ exports.mpesaCallback = async (req, res) => {
       const phone = items.find(i => i.Name === 'PhoneNumber')?.Value;
       const transactionDate = items.find(i => i.Name === 'TransactionDate')?.Value;
 
-      console.log('\n>>> PAYMENT SUCCESS - Extracted Data:');
-      console.log('  Receipt:', receipt);
-      console.log('  Phone:', phone);
-      console.log('  TransactionDate:', transactionDate);
+      fileLog('PAYMENT SUCCESS DATA', { receipt, phone, transactionDate });
 
       const [paymentRows] = await connection.query(
         'SELECT user_id, id FROM payments WHERE checkout_request_id = ?',
@@ -364,14 +392,14 @@ exports.mpesaCallback = async (req, res) => {
       );
 
       if (!paymentRows.length) {
-        console.error('ERROR: No payment found for checkout_request_id:', checkoutRequestId);
+        fileLog('ERROR', `No payment found for checkout_request_id: ${checkoutRequestId}`);
         await connection.rollback();
         connection.release();
         return res.json({ ResultCode: 0, ResultDesc: 'Received' });
       }
 
       const userId = paymentRows[0].user_id;
-      console.log('\n>>> Found payment record. User ID:', userId);
+      fileLog('FOUND PAYMENT', { userId, paymentId: paymentRows[0].id });
 
       // LOG TABLES BEFORE UPDATE
       await logTableData(connection, 'BEFORE UPDATE', userId, checkoutRequestId);
@@ -380,44 +408,42 @@ exports.mpesaCallback = async (req, res) => {
         `UPDATE payments SET mpesa_receipt = ?, status = ?, transaction_date = ? WHERE checkout_request_id = ? AND user_id = ?`,
         [receipt, 'success', transactionDate, checkoutRequestId, userId]
       );
-      console.log('>>> Updated payments table with receipt:', receipt);
+      fileLog('UPDATE', 'Payments table updated with receipt: ' + receipt);
 
       await connection.query(
         `UPDATE subscriptions SET status = 'active', start_date = CURDATE(), end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), mpesa_receipt = ?
          WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1`,
         [receipt, userId]
       );
-      console.log('>>> Updated subscriptions table to active');
+      fileLog('UPDATE', 'Subscriptions table updated to active');
 
       await connection.query(
         `UPDATE users SET subscription = 'pro', subscription_status = 'active', subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH),
          mpesa_receipt = ?, payment_date = NOW() WHERE id = ?`,
         [receipt, userId]
       );
-      console.log('>>> Updated users table to pro subscription');
+      fileLog('UPDATE', 'Users table updated to pro subscription');
 
       await connection.commit();
-      console.log('>>> TRANSACTION COMMITTED SUCCESSFULLY');
+      fileLog('TRANSACTION', 'COMMITTED SUCCESSFULLY');
 
       // LOG TABLES AFTER UPDATE
       await logTableData(connection, 'AFTER UPDATE', userId, checkoutRequestId);
 
-      // FIXED: Fetch firebase_uid before invalidating cache
       const firebase_uid = await getUserFirebaseUid(userId);
-      console.log('>>> Invalidating cache for firebase_uid:', firebase_uid);
+      fileLog('CACHE INVALIDATE', `Invalidating cache for firebase_uid: ${firebase_uid}`);
       invalidateUserCache(firebase_uid);
     } else {
-      console.log('\n>>> PAYMENT FAILED/CANCELLED - ResultCode:', result.ResultCode);
-      console.log('>>> ResultDesc:', result.ResultDesc);
+      fileLog('PAYMENT FAILED', { ResultCode: result.ResultCode, ResultDesc: result.ResultDesc });
 
       await connection.query(
         `UPDATE payments SET mpesa_receipt = 'FAILED' WHERE checkout_request_id = ?`,
         [checkoutRequestId]
       );
-      console.log('>>> Updated payments table with FAILED status');
+      fileLog('UPDATE', 'Payments table updated with FAILED status');
 
       await connection.commit();
-      console.log('>>> TRANSACTION COMMITTED (failure recorded)');
+      fileLog('TRANSACTION', 'COMMITTED (failure recorded)');
     }
 
     connection.release();
@@ -425,10 +451,7 @@ exports.mpesaCallback = async (req, res) => {
   } catch (error) {
     await connection.rollback();
     connection.release();
-    console.error('========== CALLBACK ERROR ==========');
-    console.error('Error message:', error.message);
-    console.error('Error stack:', error.stack);
-    console.error('========== END ERROR ==========');
+    fileLog('CALLBACK ERROR', { message: error.message, stack: error.stack });
     res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
   }
 };
@@ -484,7 +507,6 @@ exports.confirmDemo = async (req, res) => {
     await connection.commit();
     connection.release();
 
-    // FIXED: Pass firebase_uid string (already have it from req)
     invalidateUserCache(firebase_uid);
     res.json({ message: 'Subscription activated successfully', receipt_used: realReceipt });
   } catch (error) {
@@ -552,7 +574,6 @@ exports.queryStkStatus = async (req, res) => {
     if (!checkout_request_id) return res.status(400).json({ message: 'checkout_request_id is required' });
 
     const token = await getMpesaToken();
-    // FIXED: Use Nairobi timezone
     const timestamp = getMpesaTimestamp();
     const shortcode = process.env.PROD_SHORTCODE_DEV;
     const passkey = process.env.PROD_PASSKEY_DEV;
