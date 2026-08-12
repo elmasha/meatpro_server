@@ -9,18 +9,30 @@ const reports = require('../controllers/reportController');
 const stock = require('../controllers/stockController');
 
 // GET /daily-operations?branch_id=1&limit=10 — Recent entries table
+// GET /daily-operations?branch_id=1&limit=10 — Recent entries table
 router.get('/daily-operations', async (req, res) => {
   try {
     const branch_id = parseInt(req.query.branch_id) || 1;
     const limit = parseInt(req.query.limit) || 10;
 
     const [rows] = await db.promise().query(`
-      SELECT date, sold_kg, revenue, (sold_kg * cost_per_kg) as total_cost, 
-             profit, closing_stock_kg, payment_cash, payment_mpesa,
-             actual_revenue, revenue_variance
-      FROM daily_entries 
-      WHERE branch_id = ? 
-      ORDER BY date DESC 
+      SELECT 
+        de.date, 
+        de.sold_kg, 
+        de.revenue, 
+        (de.sold_kg * de.cost_per_kg) as cogs,        -- ✅ Renamed: this is COGS
+        COALESCE(SUM(e.amount), 0) as total_expenses,  -- ✅ ADDED: live expenses
+        de.profit, 
+        de.closing_stock_kg, 
+        de.payment_cash, 
+        de.payment_mpesa,
+        de.actual_revenue, 
+        de.revenue_variance
+      FROM daily_entries de
+      LEFT JOIN expenses e ON de.branch_id = e.branch_id AND de.date = e.date
+      WHERE de.branch_id = ? 
+      GROUP BY de.id
+      ORDER BY de.date DESC 
       LIMIT ?
     `, [branch_id, limit]);
     res.json(rows);
