@@ -510,7 +510,7 @@ exports.getPaymentMix = async (req, res) => {
   }
 };
 
-// GET /reports/expense-breakdown
+// GET /reports/expense-breakdown-
 exports.getExpenseBreakdown = async (req, res) => {
   try {
     const { branch_id, days = 30 } = req.query;
