@@ -18,17 +18,6 @@ const invalidateDailyCache = async (branch_id, date) => {
   }
 };
 
-const verifyBranchAccess = async (firebase_uid, branch_id) => {
-  const [rows] = await db.promise().execute(
-    `SELECT 1 FROM branches br
-     JOIN businesses b ON br.business_id = b.id
-     WHERE br.id = ? AND (b.firebase_uid = ? OR br.manager_uid = ?)
-     LIMIT 1`,
-    [branch_id, firebase_uid, firebase_uid]
-  );
-  return rows.length > 0;
-};
-
 exports.createExpense = async (req, res) => {
   try {
     const { branch_id, title, amount, date } = req.body;
@@ -36,11 +25,6 @@ exports.createExpense = async (req, res) => {
 
     if (!date || !amount || !branch_id) {
       return res.status(400).json({ message: "Date, amount, and branch_id are required" });
-    }
-
-    const hasAccess = await verifyBranchAccess(firebase_uid, branch_id);
-    if (!hasAccess) {
-      return res.status(403).json({ message: "Forbidden — you do not own this branch" });
     }
 
     const normalizedTitle = title.toLowerCase().trim();
@@ -68,15 +52,15 @@ exports.getExpensesByDate = async (req, res) => {
     const { date } = req.params;
     let { branch_id } = req.query;
     const firebase_uid = req.firebase_uid;
-    
-    // FIXED: Require branch_id or auto-resolve from user profile
+
+    // Auto-resolve branch_id from user profile if not provided
     if (!branch_id) {
       const [userRows] = await db.promise().execute(
         `SELECT branch_id FROM users WHERE firebase_uid = ? LIMIT 1`,
         [firebase_uid]
       );
       branch_id = userRows[0]?.branch_id;
-      
+
       if (!branch_id) {
         return res.status(400).json({ 
           message: "branch_id is required or user has no default branch" 
@@ -85,12 +69,6 @@ exports.getExpensesByDate = async (req, res) => {
     }
 
     const cacheKey = `expenses:${date}:${branch_id}`;
-
-    // FIXED: Verify access BEFORE cache check — always runs
-    const hasAccess = await verifyBranchAccess(firebase_uid, branch_id);
-    if (!hasAccess) {
-      return res.status(403).json({ message: "Forbidden — you do not own this branch" });
-    }
 
     const cached = await redis.get(cacheKey);
     if (cached) {
