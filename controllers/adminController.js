@@ -6,7 +6,7 @@ const db = require('../config/db');
 //   try {
 //     // Try query param first, then header
 //     const firebaseUid = req.query.uid || req.headers['x-firebase-uid'];
-    
+//     
 //     if (!firebaseUid) {
 //       return res.status(401).json({ error: 'Authentication required. Provide uid parameter or x-firebase-uid header' });
 //     }
@@ -43,11 +43,12 @@ exports.getDashboardStats = async (req, res) => {
     const [[activeSubs]] = await connection.query(
       "SELECT COUNT(*) as total FROM subscriptions WHERE status = 'active'"
     );
+    // FIXED: Use status = 'success' instead of mpesa_receipt IS NOT NULL
     const [[monthlyRevenue]] = await connection.query(
       `SELECT COALESCE(SUM(amount), 0) as total 
        FROM payments 
        WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-       AND mpesa_receipt IS NOT NULL`
+       AND status = 'success'`
     );
     const [[pendingSubs]] = await connection.query(
       "SELECT COUNT(*) as total FROM subscriptions WHERE status = 'pending'"
@@ -361,7 +362,7 @@ exports.confirmPaymentManually = async (req, res) => {
     const receipt = 'ADMIN_' + Date.now();
 
     await connection.query(
-      'UPDATE payments SET mpesa_receipt = ?, transaction_date = NOW() WHERE id = ?',
+      'UPDATE payments SET mpesa_receipt = ?, status = "success", transaction_date = NOW() WHERE id = ?',
       [receipt, payment_id]
     );
 
