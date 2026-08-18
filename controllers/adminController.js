@@ -159,6 +159,130 @@ exports.updatePlan = async (req, res) => {
   }
 };
 
+
+// ==================== DELETE USER ====================
+exports.deleteUser = async (req, res) => {
+  const { id } = req.params;
+  const connection = await db.promise().getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    // 1. Check user exists
+    const [users] = await connection.query(
+      'SELECT id, name, firebase_uid FROM users WHERE id = ?',
+      [id]
+    );
+
+    if (!users.length) {
+      await connection.rollback();
+      connection.release();
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = users[0];
+
+    // 2. Optional safety: prevent deleting yourself (if you pass uid)
+    // Uncomment if you want this protection
+    // if (req.firebaseUid && user.firebase_uid === req.firebaseUid) {
+    //   await connection.rollback();
+    //   connection.release();
+    //   return res.status(400).json({ error: 'You cannot delete your own account' });
+    // }
+
+    // 3. Delete related payments (no FK constraint)
+    await connection.query('DELETE FROM payments WHERE user_id = ?', [id]);
+
+    // 4. Delete the user
+    // subscriptions will be deleted automatically because of:
+    // CONSTRAINT `fk_subs_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
+    const [result] = await connection.query('DELETE FROM users WHERE id = ?', [id]);
+
+    await connection.commit();
+    connection.release();
+
+    res.json({
+      success: true,
+      message: `User "${user.name || 'Unknown'}" deleted successfully`
+    });
+  } catch (err) {
+    await connection.rollback();
+    connection.release();
+    res.status(500).json({ error: err.message });
+  }
+};
+
+
+// ==================== START 30-DAY TRIAL ====================
+exports.startTrial = async (req, res) => {
+  const { id } = req.params;
+  const { days = 30 } = req.body;          // default 30 days
+
+  const connection = await db.promise().getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    // Check user exists
+    const [users] = await connection.query(
+      'SELECT id, name FROM users WHERE id = ?',
+      [id]
+    );
+
+    if (!users.length) {
+      await connection.rollback();
+      connection.release();
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Calculate expiry date
+    const endDate = new Date();
+    endDate.setDate(endDate.getDate() + parseInt(days));
+    const expires = endDate.toISOString().split('T')[0];
+
+    // 1. Expire any existing active subscriptions
+    await connection.query(
+      `UPDATE subscriptions 
+       SET status = 'expired' 
+       WHERE user_id = ? AND status = 'active'`,
+      [id]
+    );
+
+    // 2. Create a trial subscription record (no plan_id = free trial)
+    await connection.query(
+      `INSERT INTO subscriptions 
+         (user_id, plan_id, plan, amount, start_date, end_date, status, auto_renew)
+       VALUES (?, NULL, 'trial', 0, CURDATE(), ?, 'active', 0)`,
+      [id, expires]
+    );
+
+    // 3. Update the user record
+    await connection.query(
+      `UPDATE users 
+       SET subscription = 'trial',
+           subscription_status = 'active',
+           subscription_expires = ?
+       WHERE id = ?`,
+      [expires, id]
+    );
+
+    await connection.commit();
+    connection.release();
+
+    res.json({
+      success: true,
+      message: `User put on ${days}-day trial until ${expires}`,
+      expires
+    });
+  } catch (err) {
+    await connection.rollback();
+    connection.release();
+    res.status(500).json({ error: err.message });
+  }
+};
+
+
+
 exports.togglePlanStatus = async (req, res) => {
   const { id } = req.params;
   const { active } = req.body;

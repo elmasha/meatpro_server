@@ -20,6 +20,8 @@ router.delete('/plans/:id', admin.deletePlan);
 router.get('/users', admin.getAllUsers);
 router.put('/users/:id', admin.updateUser);
 router.put('/users/:id/subscription', admin.updateUserSubscription);
+router.delete('/users/:id', admin.deleteUser);   // ← add this
+router.post('/users/:id/trial', admin.startTrial);   // ← add this
 
 // Payments
 router.get('/payments', admin.getAllPayments);
