@@ -23,7 +23,7 @@ const invalidateBusinessCache = async (firebase_uid, business_id) => {
 // SYNC FIREBASE USER (called after login/register)
 exports.syncFirebaseUser = async (req, res) => {
   try {
-    const { firebase_uid, name, phone } = req.body;
+    const { firebase_uid, name, phone, email } = req.body;
 
     if (!firebase_uid) {
       return res.status(400).json({ message: "firebase_uid is required" });
@@ -38,9 +38,10 @@ exports.syncFirebaseUser = async (req, res) => {
       await db.promise().execute(
         `UPDATE users SET 
           name = COALESCE(?, name),
-          phone = COALESCE(?, phone)
+          phone = COALESCE(?, phone),
+          email = COALESCE(?, email)
          WHERE firebase_uid = ?`,
-        [name, phone, firebase_uid]
+        [name, phone, email, firebase_uid]
       );
 
       const [updated] = await db.promise().execute(
@@ -55,9 +56,9 @@ exports.syncFirebaseUser = async (req, res) => {
     }
 
     const [result] = await db.promise().execute(
-      `INSERT INTO users (firebase_uid, name, phone, user_type) 
-       VALUES (?, ?, ?, 'Retailer')`,
-      [firebase_uid, name || 'User', phone || null]
+      `INSERT INTO users (firebase_uid, name, phone, email, user_type) 
+       VALUES (?, ?, ?, ?, 'Retailer')`,
+      [firebase_uid, name || 'User', phone || null, email || null]
     );
 
     res.status(201).json({
@@ -67,6 +68,7 @@ exports.syncFirebaseUser = async (req, res) => {
         firebase_uid, 
         name: name || 'User',
         phone,
+        email,
         user_type: 'Retailer'
       }
     });
@@ -284,7 +286,6 @@ exports.updateMyBusiness = async (req, res) => {
 exports.createBranch = async (req, res) => {
   try {
     const { business_id, name, location, firebase_uid } = req.body;
-
 
     // Verify user owns this business
     const [business] = await db.promise().execute(
