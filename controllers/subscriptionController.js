@@ -278,20 +278,35 @@ exports.initiatePayment = async (req, res) => {
     const userId = await getUserId(firebase_uid);
     if (!userId) return res.status(404).json({ message: 'User not found' });
 
+    // Fetch the specific plan from database based on plan_id
     const [plans] = await db.promise().query(
       'SELECT * FROM plans WHERE id = ? AND is_active = 1', [plan_id]
     );
     if (!plans.length) return res.status(400).json({ message: 'Invalid plan' });
 
-    const plan = plans[0];
+    const plan = plans[0]; // This is the user-selected plan
     const reference = `MPESA_${Date.now()}_${userId}`;
 
+    // Determine subscription duration based on plan type
+    let durationMonths = 1; // default
+    if (plan.duration_months) {
+      durationMonths = plan.duration_months;
+    } else if (plan.name.toLowerCase().includes('yearly') || plan.name.toLowerCase().includes('annual')) {
+      durationMonths = 12;
+    } else if (plan.name.toLowerCase().includes('quarterly')) {
+      durationMonths = 3;
+    } else if (plan.name.toLowerCase().includes('monthly')) {
+      durationMonths = 1;
+    }
+
+    // Insert subscription with the selected plan's details
     const [subResult] = await db.promise().query(
       `INSERT INTO subscriptions (user_id, plan_id, plan, amount, start_date, end_date, status, payment_reference, created_at)
-       VALUES (?, ?, ?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 'pending', ?, NOW())`,
-      [userId, plan.id, plan.name, plan.price_kes, reference]
+       VALUES (?, ?, ?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL ? MONTH), 'pending', ?, NOW())`,
+      [userId, plan.id, plan.name, plan.price_kes, durationMonths, reference]
     );
 
+    // Insert payment record with the selected plan's details
     const [paymentResult] = await db.promise().query(
       `INSERT INTO payments (user_id, amount, phone, subscription, checkout_request_id, mpesa_receipt, transaction_date, created_at)
        VALUES (?, ?, ?, ?, ?, NULL, NULL, NOW())`,
@@ -320,7 +335,7 @@ exports.initiatePayment = async (req, res) => {
             PhoneNumber: phone,
             CallBackURL: `${process.env.BASE_URL}/api/subscriptions/callback`,
             AccountReference: `MeatPro_${userId}`,
-            TransactionDesc: `MeatPro ${plan.display_name}`
+            TransactionDesc: `MeatPro ${plan.display_name || plan.name}`
           })
         },
         (error, response, body) => {
@@ -341,7 +356,13 @@ exports.initiatePayment = async (req, res) => {
     res.json({
       message: 'Payment initiated. Check your phone for M-Pesa prompt.',
       subscription_id: subResult.insertId,
-      amount: plan.price_kes,
+      plan_details: {
+        plan_id: plan.id,
+        plan_name: plan.name,
+        plan_display_name: plan.display_name || plan.name,
+        amount: plan.price_kes,
+        duration_months: durationMonths
+      },
       phone: phone,
       reference: reference,
       checkout_request_id: stkResponse.CheckoutRequestID || null,
@@ -386,8 +407,13 @@ exports.mpesaCallback = async (req, res) => {
 
       fileLog('PAYMENT SUCCESS DATA', { receipt, phone, transactionDate });
 
+      // Get payment and subscription details
       const [paymentRows] = await connection.query(
-        'SELECT user_id, id FROM payments WHERE checkout_request_id = ?',
+        `SELECT p.user_id, p.id, p.subscription, s.plan_id, s.plan, s.amount
+         FROM payments p
+         LEFT JOIN subscriptions s ON s.payment_reference = p.checkout_request_id
+         WHERE p.checkout_request_id = ?
+         ORDER BY s.id DESC LIMIT 1`,
         [checkoutRequestId]
       );
 
@@ -399,30 +425,69 @@ exports.mpesaCallback = async (req, res) => {
       }
 
       const userId = paymentRows[0].user_id;
-      fileLog('FOUND PAYMENT', { userId, paymentId: paymentRows[0].id });
+      const planName = paymentRows[0].plan || paymentRows[0].subscription;
+      const planId = paymentRows[0].plan_id;
+      
+      fileLog('FOUND PAYMENT', { 
+        userId, 
+        paymentId: paymentRows[0].id,
+        planName,
+        planId
+      });
+
+      // Determine subscription duration based on the plan
+      let durationMonths = 1; // default
+      
+      // Fetch plan details to get duration if needed
+      if (planId) {
+        const [planDetails] = await connection.query(
+          'SELECT * FROM plans WHERE id = ?', [planId]
+        );
+        if (planDetails.length && planDetails[0].duration_months) {
+          durationMonths = planDetails[0].duration_months;
+        } else if (planName.toLowerCase().includes('yearly') || planName.toLowerCase().includes('annual')) {
+          durationMonths = 12;
+        } else if (planName.toLowerCase().includes('quarterly')) {
+          durationMonths = 3;
+        }
+      }
 
       // LOG TABLES BEFORE UPDATE
       await logTableData(connection, 'BEFORE UPDATE', userId, checkoutRequestId);
 
+      // Update payments table
       await connection.query(
-        `UPDATE payments SET mpesa_receipt = ?, status = ?, transaction_date = ? WHERE checkout_request_id = ? AND user_id = ?`,
+        `UPDATE payments SET mpesa_receipt = ?, status = ?, transaction_date = ? 
+         WHERE checkout_request_id = ? AND user_id = ?`,
         [receipt, 'success', transactionDate, checkoutRequestId, userId]
       );
       fileLog('UPDATE', 'Payments table updated with receipt: ' + receipt);
 
+      // Update subscriptions table with correct duration
       await connection.query(
-        `UPDATE subscriptions SET status = 'active', start_date = CURDATE(), end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), mpesa_receipt = ?
-         WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1`,
-        [receipt, userId]
+        `UPDATE subscriptions 
+         SET status = 'active', 
+             start_date = CURDATE(), 
+             end_date = DATE_ADD(CURDATE(), INTERVAL ? MONTH), 
+             mpesa_receipt = ?
+         WHERE user_id = ? AND status = 'pending' 
+         ORDER BY id DESC LIMIT 1`,
+        [durationMonths, receipt, userId]
       );
-      fileLog('UPDATE', 'Subscriptions table updated to active');
+      fileLog('UPDATE', `Subscriptions table updated to active for ${durationMonths} month(s)`);
 
+      // Update users table with plan-specific information
       await connection.query(
-        `UPDATE users SET subscription = 'pro', subscription_status = 'active', subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH),
-         mpesa_receipt = ?, payment_date = NOW() WHERE id = ?`,
-        [receipt, userId]
+        `UPDATE users 
+         SET subscription = ?, 
+             subscription_status = 'active', 
+             subscription_expires = DATE_ADD(CURDATE(), INTERVAL ? MONTH),
+             mpesa_receipt = ?, 
+             payment_date = NOW() 
+         WHERE id = ?`,
+        [planName.toLowerCase().includes('pro') ? 'pro' : planName.toLowerCase(), durationMonths, receipt, userId]
       );
-      fileLog('UPDATE', 'Users table updated to pro subscription');
+      fileLog('UPDATE', `Users table updated to ${planName} subscription`);
 
       await connection.commit();
       fileLog('TRANSACTION', 'COMMITTED SUCCESSFULLY');
@@ -433,6 +498,7 @@ exports.mpesaCallback = async (req, res) => {
       const firebase_uid = await getUserFirebaseUid(userId);
       fileLog('CACHE INVALIDATE', `Invalidating cache for firebase_uid: ${firebase_uid}`);
       invalidateUserCache(firebase_uid);
+      
     } else {
       fileLog('PAYMENT FAILED', { ResultCode: result.ResultCode, ResultDesc: result.ResultDesc });
 
@@ -441,6 +507,14 @@ exports.mpesaCallback = async (req, res) => {
         [checkoutRequestId]
       );
       fileLog('UPDATE', 'Payments table updated with FAILED status');
+
+      // Also update the subscription to failed status
+      await connection.query(
+        `UPDATE subscriptions SET status = 'failed' 
+         WHERE payment_reference = ? AND status = 'pending'`,
+        [checkoutRequestId]
+      );
+      fileLog('UPDATE', 'Subscriptions table updated to failed status');
 
       await connection.commit();
       fileLog('TRANSACTION', 'COMMITTED (failure recorded)');
