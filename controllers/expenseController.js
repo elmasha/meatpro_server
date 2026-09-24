@@ -11,14 +11,19 @@ const invalidateDailyCache = async (branch_id, date) => {
     `stock:current:${branch_id || 'all'}`,
     `report:last-entry:${branch_id || 'all'}`,
     `report:last-7-days:${branch_id || 'all'}`,
-    `report:month-to-date:${branch_id || 'all'}`
+    `report:month-to-date:${branch_id || 'all'}`,
+    `daily:last:${branch_id || 'all'}`
   ];
   for (const key of keys) {
     await redis.del(key);
   }
 };
 
+// ─────────────────────────────────────────────────────────────
+// CREATE EXPENSE — blocked if the day is already closed
+// ─────────────────────────────────────────────────────────────
 exports.createExpense = async (req, res) => {
+  const connection = await db.promise().getConnection();
   try {
     const { branch_id, title, amount, date } = req.body;
     const firebase_uid = req.firebase_uid;
@@ -27,12 +32,32 @@ exports.createExpense = async (req, res) => {
       return res.status(400).json({ message: "Date, amount, and branch_id are required" });
     }
 
-    const normalizedTitle = title.toLowerCase().trim();
+    const normalizedTitle = (title || '').toString().toLowerCase().trim();
+
+    await connection.beginTransaction();
+
+    // ── HARD LOCK: check if the day has been closed ──
+    const [existingEntry] = await connection.execute(
+      `SELECT id FROM daily_entries 
+        WHERE branch_id = ? AND date = ? 
+        FOR UPDATE`,
+      [branch_id, date]
+    );
+
+    if (existingEntry.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({
+        message: `The day ${date} is already closed. Expenses cannot be added.`,
+        code: 'ENTRY_LOCKED'
+      });
+    }
 
     const query = `INSERT INTO expenses (branch_id, title, amount, date) VALUES (?, ?, ?, ?)`;
-    const [result] = await db.promise().execute(query, [
+    const [result] = await connection.execute(query, [
       branch_id, normalizedTitle, parseFloat(amount), date
     ]);
+
+    await connection.commit();
 
     await invalidateDailyCache(branch_id, date);
     await redis.del(`expenses:${date}:${branch_id}`);
@@ -43,10 +68,16 @@ exports.createExpense = async (req, res) => {
     });
 
   } catch (error) {
+    try { await connection.rollback(); } catch (_) {}
     res.status(500).json({ message: error.message });
+  } finally {
+    connection.release();
   }
 };
 
+// ─────────────────────────────────────────────────────────────
+// GET EXPENSES BY DATE
+// ─────────────────────────────────────────────────────────────
 exports.getExpensesByDate = async (req, res) => {
   try {
     const { date } = req.params;
@@ -86,5 +117,115 @@ exports.getExpensesByDate = async (req, res) => {
 
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// UPDATE EXPENSE — blocked if the day is already closed
+// (Optional — only if you have an edit-expense route)
+// ─────────────────────────────────────────────────────────────
+exports.updateExpense = async (req, res) => {
+  const connection = await db.promise().getConnection();
+  try {
+    const { id } = req.params;
+    const { title, amount } = req.body;
+
+    await connection.beginTransaction();
+
+    const [rows] = await connection.execute(
+      `SELECT branch_id, date FROM expenses WHERE id = ? FOR UPDATE`,
+      [id]
+    );
+
+    if (rows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'Expense not found' });
+    }
+
+    const { branch_id, date } = rows[0];
+
+    // Check if the day is closed
+    const [closed] = await connection.execute(
+      `SELECT id FROM daily_entries WHERE branch_id = ? AND date = ? LIMIT 1`,
+      [branch_id, date]
+    );
+
+    if (closed.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({
+        message: `The day ${date} is already closed. Expenses cannot be modified.`,
+        code: 'ENTRY_LOCKED'
+      });
+    }
+
+    const normalizedTitle = (title || '').toString().toLowerCase().trim();
+
+    await connection.execute(
+      `UPDATE expenses SET title = ?, amount = ? WHERE id = ?`,
+      [normalizedTitle, fmt(amount), id]
+    );
+
+    await connection.commit();
+
+    await invalidateDailyCache(branch_id, date);
+    await redis.del(`expenses:${date}:${branch_id}`);
+
+    res.json({ message: 'Expense updated' });
+  } catch (error) {
+    try { await connection.rollback(); } catch (_) {}
+    res.status(500).json({ message: error.message });
+  } finally {
+    connection.release();
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// DELETE EXPENSE — blocked if the day is already closed
+// (Optional — only if you have a delete-expense route)
+// ─────────────────────────────────────────────────────────────
+exports.deleteExpense = async (req, res) => {
+  const connection = await db.promise().getConnection();
+  try {
+    const { id } = req.params;
+
+    await connection.beginTransaction();
+
+    const [rows] = await connection.execute(
+      `SELECT branch_id, date FROM expenses WHERE id = ? FOR UPDATE`,
+      [id]
+    );
+
+    if (rows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'Expense not found' });
+    }
+
+    const { branch_id, date } = rows[0];
+
+    const [closed] = await connection.execute(
+      `SELECT id FROM daily_entries WHERE branch_id = ? AND date = ? LIMIT 1`,
+      [branch_id, date]
+    );
+
+    if (closed.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({
+        message: `The day ${date} is already closed. Expenses cannot be deleted.`,
+        code: 'ENTRY_LOCKED'
+      });
+    }
+
+    await connection.execute(`DELETE FROM expenses WHERE id = ?`, [id]);
+    await connection.commit();
+
+    await invalidateDailyCache(branch_id, date);
+    await redis.del(`expenses:${date}:${branch_id}`);
+
+    res.json({ message: 'Expense deleted' });
+  } catch (error) {
+    try { await connection.rollback(); } catch (_) {}
+    res.status(500).json({ message: error.message });
+  } finally {
+    connection.release();
   }
 };
