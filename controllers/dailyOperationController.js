@@ -8,7 +8,8 @@ const invalidateDailyCache = async (branch_id, date) => {
     `stock:current:${branch_id || 'all'}`,
     `report:last-entry:${branch_id || 'all'}`,
     `report:last-7-days:${branch_id || 'all'}`,
-    `report:month-to-date:${branch_id || 'all'}`
+    `report:month-to-date:${branch_id || 'all'}`,
+    `daily:last:${branch_id || 'all'}`
   ];
   for (const key of keys) { await redis.del(key); }
 };
@@ -38,8 +39,8 @@ const calculateDateTotals = async (connection, branch_id, date) => {
   const [opsRows] = await connection.execute(
     `SELECT 
       COALESCE(SUM(actual_revenue), 0) as totalActualRevenue,
-      COALESCE(SUM(expected_revenue), 0) as totalExpectedRevenue,
-      COALESCE(SUM(sold_kg * cost_per_kg), 0) as totalCogs,
+      COALESCE(SUM(revenue), 0) as totalExpectedRevenue,
+      COALESCE(SUM(cogs), 0) as totalCogs,
       COALESCE(SUM(sold_kg), 0) as totalSoldKg,
       COALESCE(SUM(opening_stock_kg), 0) as totalOpeningStock,
       COALESCE(SUM(closing_stock_kg), 0) as totalClosingStock,
@@ -55,7 +56,7 @@ const calculateDateTotals = async (connection, branch_id, date) => {
   const totalCogs = parseFloat(ops.totalCogs) || 0;
   const totalExpenses = await getDailyExpenses(connection, branch_id, date);
 
-  // ✅ OPTION B: Profit = Revenue - Expenses only (COGS NOT subtracted)
+  // ✅ Profit = Revenue − Expenses only (COGS NOT subtracted)
   const totalProfit = totalActualRevenue - totalExpenses;
   const totalExpectedProfit = totalExpectedRevenue - totalExpenses;
 
@@ -78,38 +79,43 @@ const calculateDateTotals = async (connection, branch_id, date) => {
 
 exports.createOrUpdateDailyOperation = async (req, res) => {
   try {
-    const { branch_id, date, opening_stock_kg, supply_kg, waste_kg, closing_stock_kg, cost_per_kg, selling_price_per_kg, payment_cash, payment_mpesa } = req.body;
+    const {
+      branch_id, date,
+      opening_stock_kg, supply_kg, waste_kg, closing_stock_kg,
+      cost_per_kg, selling_price_per_kg,
+      payment_cash, payment_mpesa
+    } = req.body;
     const firebase_uid = req.firebase_uid;
 
     if (!date || !branch_id) {
       return res.status(400).json({ message: "Date and branch_id are required" });
     }
 
- 
     const opening = parseFloat(opening_stock_kg) || 0;
-    const supply = parseFloat(supply_kg) || 0;
-    const waste = parseFloat(waste_kg) || 0;
-    const close = parseFloat(closing_stock_kg) || 0;
-    const cost = parseFloat(cost_per_kg) || 0;
-    const price = parseFloat(selling_price_per_kg) || 0;
-    const cash = parseFloat(payment_cash) || 0;
-    const mpesa = parseFloat(payment_mpesa) || 0;
+    const supply  = parseFloat(supply_kg) || 0;
+    const waste   = parseFloat(waste_kg) || 0;
+    const close   = parseFloat(closing_stock_kg) || 0;
+    const cost    = parseFloat(cost_per_kg) || 0;
+    const price   = parseFloat(selling_price_per_kg) || 0;
+    const cash    = parseFloat(payment_cash) || 0;
+    const mpesa   = parseFloat(payment_mpesa) || 0;
 
-    // ✅ CALCULATE sold_kg from stock fields (not from req.body)
+    // ✅ Calculate sold_kg from stock fields (never trust client value)
     const sold = Math.max(0, opening + supply - waste - close);
 
     const expectedRevenue = sold * price;
-    const actualRevenue = cash + mpesa;
+    const actualRevenue   = cash + mpesa;
     const revenueVariance = expectedRevenue - actualRevenue;
-    const cogs = sold * cost;
 
-    // Get live expenses
+    // ✅ COGS is stored for reporting, but NOT deducted from profit
+    const cogs = fmt(sold * cost);
+
     const connection = await db.promise().getConnection();
     try {
       const totalExpenses = await getDailyExpenses(connection, branch_id, date);
 
-      // ✅ OPTION B: Profit = Revenue - Expenses only (COGS NOT subtracted)
-      const profit = actualRevenue - totalExpenses;
+      // ✅ Profit = Revenue − Expenses only (COGS NOT subtracted)
+      const profit         = actualRevenue - totalExpenses;
       const expectedProfit = expectedRevenue - totalExpenses;
 
       const [existing] = await connection.execute(
@@ -121,26 +127,34 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
         await connection.execute(
           `UPDATE daily_entries SET
             opening_stock_kg = ?, supply_kg = ?, sold_kg = ?, waste_kg = ?,
-            cost_per_kg = ?, selling_price_per_kg = ?, revenue = ?,
+            cost_per_kg = ?, cogs = ?, selling_price_per_kg = ?, revenue = ?,
             actual_revenue = ?, payment_cash = ?, payment_mpesa = ?,
             profit = ?, expected_profit = ?, revenue_variance = ?,
             closing_stock_kg = ?, expenses = ?
           WHERE branch_id = ? AND date = ?`,
-          [opening, supply, sold, waste, cost, price, expectedRevenue,
-           actualRevenue, cash, mpesa, profit, expectedProfit, revenueVariance,
-           close, totalExpenses, branch_id, date]
+          [
+            opening, supply, sold, waste,
+            cost, cogs, price, expectedRevenue,
+            actualRevenue, cash, mpesa,
+            profit, expectedProfit, revenueVariance,
+            close, totalExpenses,
+            branch_id, date
+          ]
         );
       } else {
         await connection.execute(
           `INSERT INTO daily_entries
             (branch_id, date, opening_stock_kg, supply_kg, sold_kg, waste_kg,
-             cost_per_kg, selling_price_per_kg, revenue, actual_revenue,
+             cost_per_kg, cogs, selling_price_per_kg, revenue, actual_revenue,
              payment_cash, payment_mpesa, profit, expected_profit,
              revenue_variance, closing_stock_kg, expenses)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [branch_id, date, opening, supply, sold, waste, cost, price,
-           expectedRevenue, actualRevenue, cash, mpesa, profit, expectedProfit,
-           revenueVariance, close, totalExpenses]
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            branch_id, date, opening, supply, sold, waste,
+            cost, cogs, price, expectedRevenue, actualRevenue,
+            cash, mpesa, profit, expectedProfit,
+            revenueVariance, close, totalExpenses
+          ]
         );
       }
 
@@ -149,11 +163,24 @@ exports.createOrUpdateDailyOperation = async (req, res) => {
       res.status(200).json({
         message: existing.length > 0 ? "Entry updated" : "Entry created",
         data: {
-          date, opening_stock_kg: opening, supply_kg: supply, sold_kg: sold, waste_kg: waste,
-          cost_per_kg: cost, selling_price_per_kg: price,
-          expectedRevenue, actualRevenue, payment_cash: cash, payment_mpesa: mpesa,
-          cogs, totalCost: totalExpenses, totalExpenses, profit, expectedProfit,
-          revenueVariance, closing_stock_kg: close
+          date,
+          opening_stock_kg: opening,
+          supply_kg: supply,
+          sold_kg: sold,
+          waste_kg: waste,
+          cost_per_kg: cost,
+          cogs,
+          selling_price_per_kg: price,
+          expectedRevenue,
+          actualRevenue,
+          payment_cash: cash,
+          payment_mpesa: mpesa,
+          totalCost: totalExpenses,
+          totalExpenses,
+          profit,
+          expectedProfit,
+          revenueVariance,
+          closing_stock_kg: close
         }
       });
     } finally {
@@ -191,20 +218,26 @@ exports.getLastEntry = async (req, res) => {
       const entry = rows[0];
       const date = entry.date;
       const liveExpenses = await getDailyExpenses(connection, branch_id, date);
-      const cogs = parseFloat(entry.sold_kg) * parseFloat(entry.cost_per_kg) || 0;
-      const actualRevenue = parseFloat(entry.actual_revenue) || 0;
 
-      // ✅ OPTION B: Profit = Revenue - Expenses only
-      const actualProfit = actualRevenue - liveExpenses;
+      // ✅ Read persisted cogs; fallback to computed if legacy row
+      const cogs = parseFloat(entry.cogs) || fmt(parseFloat(entry.sold_kg) * parseFloat(entry.cost_per_kg));
+      const actualRevenue = parseFloat(entry.actual_revenue) || 0;
+      const expectedRevenue = parseFloat(entry.revenue) || 0;
+
+      // ✅ Profit = Revenue − Expenses only (COGS NOT subtracted)
+      const actualProfit   = actualRevenue - liveExpenses;
+      const expectedProfit = expectedRevenue - liveExpenses;
       const marginPct = actualRevenue > 0 ? ((actualProfit / actualRevenue) * 100).toFixed(1) : 0;
 
       const result = {
         ...entry,
         actualRevenue: fmt(actualRevenue),
+        expectedRevenue: fmt(expectedRevenue),
         cogs: fmt(cogs),
         totalCost: fmt(liveExpenses),
         totalExpenses: fmt(liveExpenses),
         actualProfit: fmt(actualProfit),
+        expectedProfit: fmt(expectedProfit),
         marginPct: fmt(marginPct)
       };
 
@@ -239,19 +272,25 @@ exports.getEntryByDate = async (req, res) => {
 
       const entry = rows[0];
       const liveExpenses = await getDailyExpenses(connection, branch_id, date);
-      const cogs = parseFloat(entry.sold_kg) * parseFloat(entry.cost_per_kg) || 0;
-      const actualRevenue = parseFloat(entry.actual_revenue) || 0;
 
-      // ✅ OPTION B: Profit = Revenue - Expenses only
-      const actualProfit = actualRevenue - liveExpenses;
+      // ✅ Read persisted cogs; fallback to computed if legacy row
+      const cogs = parseFloat(entry.cogs) || fmt(parseFloat(entry.sold_kg) * parseFloat(entry.cost_per_kg));
+      const actualRevenue = parseFloat(entry.actual_revenue) || 0;
+      const expectedRevenue = parseFloat(entry.revenue) || 0;
+
+      // ✅ Profit = Revenue − Expenses only (COGS NOT subtracted)
+      const actualProfit   = actualRevenue - liveExpenses;
+      const expectedProfit = expectedRevenue - liveExpenses;
 
       res.status(200).json({
         ...entry,
         actualRevenue: fmt(actualRevenue),
+        expectedRevenue: fmt(expectedRevenue),
         cogs: fmt(cogs),
         totalCost: fmt(liveExpenses),
         totalExpenses: fmt(liveExpenses),
-        actualProfit: fmt(actualProfit)
+        actualProfit: fmt(actualProfit),
+        expectedProfit: fmt(expectedProfit)
       });
     } finally {
       connection.release();
@@ -279,18 +318,25 @@ exports.getDailyOperationsByDateRange = async (req, res) => {
       const results = [];
       for (const entry of rows) {
         const liveExpenses = await getDailyExpenses(connection, branch_id, entry.date);
-        const cogs = parseFloat(entry.sold_kg) * parseFloat(entry.cost_per_kg) || 0;
-        const actualRevenue = parseFloat(entry.actual_revenue) || 0;
 
-        // ✅ OPTION B: Profit = Revenue - Expenses only
-        const actualProfit = actualRevenue - liveExpenses;
+        // ✅ Read persisted cogs; fallback to computed if legacy row
+        const cogs = parseFloat(entry.cogs) || fmt(parseFloat(entry.sold_kg) * parseFloat(entry.cost_per_kg));
+        const actualRevenue = parseFloat(entry.actual_revenue) || 0;
+        const expectedRevenue = parseFloat(entry.revenue) || 0;
+
+        // ✅ Profit = Revenue − Expenses only (COGS NOT subtracted)
+        const actualProfit   = actualRevenue - liveExpenses;
+        const expectedProfit = expectedRevenue - liveExpenses;
 
         results.push({
           ...entry,
+          actualRevenue: fmt(actualRevenue),
+          expectedRevenue: fmt(expectedRevenue),
           cogs: fmt(cogs),
           totalCost: fmt(liveExpenses),
           totalExpenses: fmt(liveExpenses),
-          actualProfit: fmt(actualProfit)
+          actualProfit: fmt(actualProfit),
+          expectedProfit: fmt(expectedProfit)
         });
       }
 
