@@ -4,9 +4,18 @@ const { queueChangeRequest, applyChange } = require('../services/changeRequest')
 const { audit } = require('../middleware/adminAuth');
 
 // ============================================================
+// Helper: safely serialize any value for a JSON column.
+// mysql2 will throw "Invalid JSON text: [object Object]" if you
+// hand it a plain object for a JSON column. This coerces it.
+// ============================================================
+function toJson(v) {
+  if (v == null) return null;
+  if (typeof v === 'string') return v;   // assume it's already JSON text
+  return JSON.stringify(v);              // object, array, number, boolean
+}
+
+// ============================================================
 // Which actions require maker-checker approval?
-// Anything NOT in this set runs immediately (for admins).
-// Super admins bypass the queue entirely.
 // ============================================================
 const REQUIRES_APPROVAL = new Set([
   'plan.create', 'plan.update', 'plan.delete', 'plan.toggle',
@@ -32,7 +41,7 @@ function queuedResponse(res, { request_code, expires_at, id }) {
 }
 
 // ============================================================
-// DASHBOARD STATS  (read-only — no approval needed)
+// DASHBOARD STATS
 // ============================================================
 exports.getDashboardStats = async (req, res) => {
   try {
@@ -110,7 +119,6 @@ exports.createPlan = async (req, res) => {
     const action = 'plan.create';
     const payload = { name, display_name, price_kes, billing_cycle, description, features };
 
-    // Super admin: apply immediately
     if (!needsApproval(action) || req.admin.role === 'super_admin') {
       const featuresJson = Array.isArray(features) ? JSON.stringify(features) : features;
       const [result] = await db.promise().query(
@@ -129,7 +137,6 @@ exports.createPlan = async (req, res) => {
       });
     }
 
-    // Maker: queue for approval
     const queued = await queueChangeRequest({
       req, action, targetType: 'plan', targetId: null,
       before: null, after: payload,
@@ -155,7 +162,6 @@ exports.updatePlan = async (req, res) => {
     const action = 'plan.update';
     const payload = { id: parseInt(id), display_name, price_kes, billing_cycle, description, features, is_active };
 
-    // Super admin: apply immediately (unchanged behaviour)
     if (req.admin.role === 'super_admin') {
       const updates = [];
       const values = [];
@@ -182,7 +188,6 @@ exports.updatePlan = async (req, res) => {
       return res.json({ success: true, message: 'Plan updated successfully' });
     }
 
-    // Maker: queue
     const queued = await queueChangeRequest({
       req, action, targetType: 'plan', targetId: id,
       before, after: payload,
@@ -230,7 +235,6 @@ exports.deletePlan = async (req, res) => {
   const { id } = req.params;
 
   try {
-    // Refuse at request time if active subs exist (fail fast for the maker)
     const [subs] = await db.promise().query(
       'SELECT COUNT(*) as count FROM subscriptions WHERE plan_id = ? AND status = "active"',
       [id]
@@ -332,7 +336,6 @@ exports.deleteUser = async (req, res) => {
     if (!users.length) return res.status(404).json({ error: 'User not found' });
     const user = users[0];
 
-    // Never allow deleting yourself
     if (req.admin?.uid && user.firebase_uid === req.admin.uid) {
       return res.status(400).json({ error: 'You cannot delete your own account' });
     }
@@ -882,7 +885,6 @@ exports.getBusinessBranches = async (req, res) => {
 // CHANGE REQUESTS — the approval engine
 // ============================================================
 
-// List pending requests (super-admin only, enforced in routes)
 exports.getPendingChangeRequests = async (req, res) => {
   try {
     const [rows] = await db.promise().query(`
@@ -898,7 +900,6 @@ exports.getPendingChangeRequests = async (req, res) => {
   }
 };
 
-// Fetch a single request by its short code (for the approve page from the SMS link)
 exports.getChangeRequestByCode = async (req, res) => {
   const { code } = req.params;
   try {
@@ -917,7 +918,6 @@ exports.getChangeRequestByCode = async (req, res) => {
   }
 };
 
-// Approve or reject
 exports.decideChangeRequest = async (req, res) => {
   const { code } = req.params;
   const { decision } = req.body;
@@ -954,7 +954,7 @@ exports.decideChangeRequest = async (req, res) => {
       return res.status(429).json({ error: 'Too many attempts' });
     }
 
-    // Self-approval block: super admin cannot approve their own request
+    // Self-approval block
     if (r.maker_uid === req.admin.uid) {
       await conn.query(
         `UPDATE admin_change_requests SET attempts = attempts + 1 WHERE id = ?`,
@@ -973,13 +973,23 @@ exports.decideChangeRequest = async (req, res) => {
           WHERE id=?`,
         [req.admin.uid, req.admin.email, r.id]
       );
+      // *** BUG FIX: toJson() ensures payload is valid JSON, not [object Object] ***
       await conn.query(
         `INSERT INTO admin_audit_log
            (admin_uid, admin_email, action, target_type, target_id,
             payload, change_request_id, ip_address, user_agent)
          VALUES (?,?,?,?,?,?,?,?,?)`,
-        [req.admin.uid, req.admin.email, `reject.${r.action}`, r.target_type, r.target_id,
-         null, r.id, req.ip, (req.get('user-agent') || '').slice(0, 255)]
+        [
+          req.admin.uid,
+          req.admin.email,
+          `reject.${r.action}`,
+          r.target_type,
+          r.target_id,
+          toJson(r.payload_before),               // ← FIXED
+          r.id,
+          req.ip,
+          (req.get('user-agent') || '').slice(0, 255),
+        ]
       );
       await conn.commit();
       return res.json({ success: true, status: 'rejected' });
@@ -994,13 +1004,24 @@ exports.decideChangeRequest = async (req, res) => {
         WHERE id=?`,
       [req.admin.uid, req.admin.email, r.id]
     );
+
+    // *** BUG FIX: toJson() ensures payload is valid JSON, not [object Object] ***
     await conn.query(
       `INSERT INTO admin_audit_log
          (admin_uid, admin_email, action, target_type, target_id,
           payload, change_request_id, ip_address, user_agent)
        VALUES (?,?,?,?,?,?,?,?,?)`,
-      [req.admin.uid, req.admin.email, `approve.${r.action}`, r.target_type, r.target_id,
-       r.payload_after, r.id, req.ip, (req.get('user-agent') || '').slice(0, 255)]
+      [
+        req.admin.uid,
+        req.admin.email,
+        `approve.${r.action}`,
+        r.target_type,
+        r.target_id,
+        toJson(r.payload_after),                  // ← FIXED
+        r.id,
+        req.ip,
+        (req.get('user-agent') || '').slice(0, 255),
+      ]
     );
 
     await conn.commit();
