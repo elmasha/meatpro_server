@@ -54,6 +54,9 @@ app.post('/api/admin/subscriptions/:id/renew', adminController.renewSubscription
 app.post('/api/admin/subscriptions/:id/extend', adminController.extendSubscription);
 app.post('/api/admin/subscriptions/:id/cancel', adminController.cancelSubscription);
 
+const adminRoutes = require('./routes/adminRoutes');
+app.use('/api/admin', adminRoutes);
+
 // Payments
 app.get('/api/admin/payments', adminController.getAllPayments);
 app.post('/api/admin/payments/confirm', adminController.confirmPaymentManually);
