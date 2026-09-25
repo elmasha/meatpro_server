@@ -5,13 +5,11 @@ const { audit } = require('../middleware/adminAuth');
 
 // ============================================================
 // Helper: safely serialize any value for a JSON column.
-// mysql2 will throw "Invalid JSON text: [object Object]" if you
-// hand it a plain object for a JSON column. This coerces it.
 // ============================================================
 function toJson(v) {
   if (v == null) return null;
-  if (typeof v === 'string') return v;   // assume it's already JSON text
-  return JSON.stringify(v);              // object, array, number, boolean
+  if (typeof v === 'string') return v;
+  return JSON.stringify(v);
 }
 
 // ============================================================
@@ -28,7 +26,6 @@ function needsApproval(action) {
   return REQUIRES_APPROVAL.has(action);
 }
 
-// Helper: standard 202 response for a queued change
 function queuedResponse(res, { request_code, expires_at, id }) {
   return res.status(202).json({
     success: true,
@@ -884,7 +881,6 @@ exports.getBusinessBranches = async (req, res) => {
 // ============================================================
 // CHANGE REQUESTS — the approval engine
 // ============================================================
-
 exports.getPendingChangeRequests = async (req, res) => {
   try {
     const [rows] = await db.promise().query(`
@@ -954,7 +950,6 @@ exports.decideChangeRequest = async (req, res) => {
       return res.status(429).json({ error: 'Too many attempts' });
     }
 
-    // Self-approval block
     if (r.maker_uid === req.admin.uid) {
       await conn.query(
         `UPDATE admin_change_requests SET attempts = attempts + 1 WHERE id = ?`,
@@ -973,7 +968,6 @@ exports.decideChangeRequest = async (req, res) => {
           WHERE id=?`,
         [req.admin.uid, req.admin.email, r.id]
       );
-      // *** BUG FIX: toJson() ensures payload is valid JSON, not [object Object] ***
       await conn.query(
         `INSERT INTO admin_audit_log
            (admin_uid, admin_email, action, target_type, target_id,
@@ -985,7 +979,7 @@ exports.decideChangeRequest = async (req, res) => {
           `reject.${r.action}`,
           r.target_type,
           r.target_id,
-          toJson(r.payload_before),               // ← FIXED
+          toJson(r.payload_before),
           r.id,
           req.ip,
           (req.get('user-agent') || '').slice(0, 255),
@@ -995,7 +989,6 @@ exports.decideChangeRequest = async (req, res) => {
       return res.json({ success: true, status: 'rejected' });
     }
 
-    // APPROVE → apply
     await applyChange(conn, r);
 
     await conn.query(
@@ -1005,7 +998,6 @@ exports.decideChangeRequest = async (req, res) => {
       [req.admin.uid, req.admin.email, r.id]
     );
 
-    // *** BUG FIX: toJson() ensures payload is valid JSON, not [object Object] ***
     await conn.query(
       `INSERT INTO admin_audit_log
          (admin_uid, admin_email, action, target_type, target_id,
@@ -1017,7 +1009,7 @@ exports.decideChangeRequest = async (req, res) => {
         `approve.${r.action}`,
         r.target_type,
         r.target_id,
-        toJson(r.payload_after),                  // ← FIXED
+        toJson(r.payload_after),
         r.id,
         req.ip,
         (req.get('user-agent') || '').slice(0, 255),
@@ -1036,18 +1028,19 @@ exports.decideChangeRequest = async (req, res) => {
 };
 
 // ============================================================
-// Send a password-reset email on behalf of a user
-// Super-admin only (enforced in routes)
+// SEND PASSWORD RESET (super-admin only)
+//
+// Uses the Firebase REST API directly. No Firebase Admin SDK here —
+// the Admin SDK credentials were the source of "invalid_grant".
+// The Web API key is sufficient for sending the password reset email.
 // ============================================================
 exports.sendPasswordReset = async (req, res) => {
   const { id } = req.params;
 
   try {
-    const admin = require('../config/firebaseAdmin');
-
     // 1. Find the user
     const [rows] = await db.promise().query(
-      'SELECT id, name, email, firebase_uid FROM users WHERE id = ? LIMIT 1',
+      'SELECT id, name, email FROM users WHERE id = ? LIMIT 1',
       [id]
     );
     if (!rows.length) {
@@ -1059,37 +1052,66 @@ exports.sendPasswordReset = async (req, res) => {
       return res.status(400).json({ error: 'User has no email on file' });
     }
 
-    // 2. Ask Firebase to send the password reset email
-    //    Firebase uses its own email template, configured in
-    //    Firebase Console → Authentication → Templates → Password reset.
-    await admin.auth().generatePasswordResetLink(user.email);
+    // 2. Rate-limit: don't allow more than one reset per 2 minutes per user
+    const twoMinAgo = new Date(Date.now() - 2 * 60 * 1000);
+    const [recent] = await db.promise().query(
+      `SELECT id FROM admin_audit_log
+        WHERE action = 'user.passwordReset'
+          AND target_id = ?
+          AND created_at >= ?
+        LIMIT 1`,
+      [String(id), twoMinAgo]
+    );
+    if (recent.length) {
+      return res.status(429).json({
+        error: 'A reset email was just sent to this user. Wait 2 minutes before retrying.',
+      });
+    }
 
-    // Note: generatePasswordResetLink only *generates* a link; it does NOT
-    // send the email. To actually send, use the Firebase REST API's
-    // sendOobCode endpoint (see the alternative below).
-
-    // Best approach: use the REST API to send the email directly.
-    // (Firebase Admin SDK doesn't have a send-email method; we call REST.)
+    // 3. Call Firebase REST API to send the password reset email
     const FIREBASE_API_KEY = process.env.FIREBASE_WEB_API_KEY;
     if (!FIREBASE_API_KEY) {
       return res.status(500).json({
-        error: 'FIREBASE_WEB_API_KEY not configured on the server. Add it to env vars.'
+        error: 'FIREBASE_WEB_API_KEY not configured on the server.',
       });
     }
 
     const axios = require('axios');
-    const payload = {
-      requestType: 'PASSWORD_RESET',
-      email: user.email,
-    };
+    const url = `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${FIREBASE_API_KEY}`;
 
-    const r = await axios.post(
-      `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${FIREBASE_API_KEY}`,
-      payload,
-      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
-    );
+    let fbResponse;
+    try {
+      fbResponse = await axios.post(
+        url,
+        { requestType: 'PASSWORD_RESET', email: user.email },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+      );
+    } catch (axiosErr) {
+      const fbMsg = axiosErr.response?.data?.error?.message || axiosErr.message;
+      console.error('[sendPasswordReset] Firebase REST error:', fbMsg);
 
-    // 3. Audit log
+      if (fbMsg === 'EMAIL_NOT_FOUND') {
+        return res.status(404).json({
+          error: `Firebase has no account for ${user.email}. Create the account in Firebase first.`,
+        });
+      }
+      if (fbMsg === 'TOO_MANY_ATTEMPTS_TRY_LATER') {
+        return res.status(429).json({
+          error: 'Firebase has rate-limited reset emails for this address. Try later.',
+        });
+      }
+      if (fbMsg === 'INVALID_EMAIL') {
+        return res.status(400).json({ error: 'The email on file is not valid.' });
+      }
+      if (fbMsg === 'API_KEY_INVALID' || fbMsg === 'API key not valid. Please pass a valid API key.') {
+        return res.status(500).json({
+          error: 'FIREBASE_WEB_API_KEY is invalid. Check the value in Railway env vars.',
+        });
+      }
+      return res.status(500).json({ error: `Firebase: ${fbMsg}` });
+    }
+
+    // 4. Audit log
     await audit({
       admin: req.admin,
       action: 'user.passwordReset',
@@ -1105,11 +1127,7 @@ exports.sendPasswordReset = async (req, res) => {
       email: user.email,
     });
   } catch (err) {
-    console.error('[sendPasswordReset]', err.response?.data || err.message);
-    const fbErr = err.response?.data?.error?.message;
-    if (fbErr === 'EMAIL_NOT_FOUND') {
-      return res.status(404).json({ error: 'Firebase has no account with that email' });
-    }
+    console.error('[sendPasswordReset]', err.message);
     res.status(500).json({ error: err.message });
   }
 };
