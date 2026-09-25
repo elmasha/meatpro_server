@@ -1,43 +1,66 @@
+// routes/admin.js
 const express = require('express');
 const router = express.Router();
+
+const { requireAdmin, requireRole } = require('../middleware/adminAuth');
 const admin = require('../controllers/adminController');
 
-// Simple admin check — NO Firebase token verification
-// Just reads x-firebase-uid from header and checks DB
-// router.use(admin.requireAdmin);
+// ============================================================
+// Every route below requires an authenticated admin.
+// ============================================================
+router.use(requireAdmin);
 
-// Dashboard
+// ---------- Identity ----------
+router.get('/me', (req, res) => {
+  res.json({ success: true, admin: req.admin });
+});
+
+// ---------- Dashboard ----------
 router.get('/stats', admin.getDashboardStats);
 
-// Plans
+// ---------- Plans ----------
 router.get('/plans', admin.getAllPlans);
 router.post('/plans', admin.createPlan);
 router.put('/plans/:id', admin.updatePlan);
 router.patch('/plans/:id/status', admin.togglePlanStatus);
 router.delete('/plans/:id', admin.deletePlan);
 
-// Users
+// ---------- Users ----------
 router.get('/users', admin.getAllUsers);
 router.put('/users/:id', admin.updateUser);
 router.put('/users/:id/subscription', admin.updateUserSubscription);
-router.delete('/users/:id', admin.deleteUser);   // ← add this
-router.post('/users/:id/trial', admin.startTrial);   // ← add this
+router.post('/users/:id/trial', admin.startTrial);
+router.delete('/users/:id', admin.deleteUser);
 
-// Payments
+// ---------- Payments ----------
 router.get('/payments', admin.getAllPayments);
 router.post('/payments/confirm', admin.confirmPaymentManually);
 
-// Revenue
+// ---------- Revenue ----------
 router.get('/revenue', admin.getRevenueReport);
 
-// Subscriptions
+// ---------- Subscriptions ----------
 router.get('/subscriptions', admin.getActiveSubscriptions);
 router.post('/subscriptions/:id/renew', admin.renewSubscription);
 router.post('/subscriptions/:id/cancel', admin.cancelSubscription);
 router.post('/subscriptions/:id/extend', admin.extendSubscription);
 
-// Businesses
+// ---------- Businesses ----------
 router.get('/businesses', admin.getAllBusinesses);
 router.get('/businesses/:business_id/branches', admin.getBusinessBranches);
+
+// ---------- Change Requests (maker-checker) ----------
+// Reading and deciding are super-admin only.
+router.get('/change-requests',
+  requireRole('super_admin'),
+  admin.getPendingChangeRequests);
+
+router.get('/change-requests/:code',
+  requireRole('super_admin'),
+  admin.getChangeRequestByCode);
+
+router.post('/change-requests/:code/decide',
+  requireRole('super_admin'),
+  admin.decideChangeRequest);
 
 module.exports = router;

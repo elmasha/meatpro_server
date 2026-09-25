@@ -25,12 +25,82 @@ const invalidateRoleCache = async (firebase_uid) => {
   await redis.del(`user:role:${firebase_uid}`);
 };
 
+// ─── Plan branch limits ─────────────────────────────────────
+// Fallback limits keyed by plan name (lowercase).
+// These are only used if the plan's `features` JSON array doesn't
+// specify a branch limit.
+const PLAN_BRANCH_LIMITS = {
+  free: 0,
+  starter: 1,
+  business: 2,
+  pro: 3,
+};
+
+/**
+ * Resolve the branch limit for a given plan row.
+ * Priority:
+ *   1. Plan's JSON `features` array (e.g. ["2 branch", "5 users"])
+ *   2. Hardcoded PLAN_BRANCH_LIMITS fallback
+ */
+const getPlanBranchLimit = (planRow) => {
+  if (!planRow) return 0;
+
+  let features = planRow.features;
+  if (typeof features === 'string') {
+    try { features = JSON.parse(features); } catch { features = []; }
+  }
+
+  if (Array.isArray(features)) {
+    for (const f of features) {
+      const lower = String(f).toLowerCase();
+      if (lower.includes('unlimited') && lower.includes('branch')) return Infinity;
+      // Match patterns like "2 branch", "3 branches", "up to 5 branches"
+      const match = lower.match(/(\d+)\s*branch/);
+      if (match) return parseInt(match[1], 10);
+    }
+  }
+
+  const name = (planRow.name || '').toLowerCase();
+  return PLAN_BRANCH_LIMITS[name] ?? 0;
+};
+
+/**
+ * Look up the active plan row for a user.
+ * Returns null if the user has no active subscription.
+ */
+const getActivePlanForUser = async (connection, firebase_uid) => {
+  const [rows] = await connection.execute(
+    `SELECT 
+        u.subscription       AS plan_name,
+        u.subscription_status,
+        p.name               AS plan_slug,
+        p.features           AS plan_features
+       FROM users u
+       LEFT JOIN plans p ON LOWER(p.name) = LOWER(u.subscription)
+      WHERE u.firebase_uid = ?
+      LIMIT 1`,
+    [firebase_uid]
+  );
+
+  if (rows.length === 0) return null;
+
+  const row = rows[0];
+  const status = (row.subscription_status || '').toLowerCase();
+
+  // Only active subscriptions can create branches
+  if (status !== 'active') return null;
+
+  return {
+    name: row.plan_slug || row.plan_name || 'free',
+    features: row.plan_features,
+  };
+};
+
 // ==================== USER CONTROLLERS ====================
 
 // SYNC FIREBASE USER (called after login/register)
 exports.syncFirebaseUser = async (req, res) => {
   try {
-    // Trust the auth middleware, not the body
     const firebase_uid = req.firebase_uid || req.body.firebase_uid;
     const { name, phone, email } = req.body;
 
@@ -107,7 +177,6 @@ exports.getUserProfile = async (req, res) => {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    // Add role info to the response so the frontend doesn't need a second call
     const roleInfo = await getUserRole(firebase_uid);
 
     res.json({ ...rows[0], role: roleInfo.role, managed_branches: roleInfo.managed_branches });
@@ -116,7 +185,7 @@ exports.getUserProfile = async (req, res) => {
   }
 };
 
-// GET MY ROLE (dedicated endpoint)
+// GET MY ROLE
 exports.getMyRole = async (req, res) => {
   try {
     const firebase_uid = req.firebase_uid || req.query.firebase_uid;
@@ -131,7 +200,6 @@ exports.getMyRole = async (req, res) => {
 
     const roleInfo = await getUserRole(firebase_uid);
 
-    // Fetch branches the user can access
     let branches = [];
     if (roleInfo.role === 'owner') {
       const [rows] = await db.promise().execute(
@@ -156,7 +224,7 @@ exports.getMyRole = async (req, res) => {
     }
 
     const result = {
-      role: roleInfo.role,                       // 'owner' | 'manager' | 'none'
+      role: roleInfo.role,
       business_id: roleInfo.business_id,
       primary_branch_id: roleInfo.primary_branch_id,
       accessible_branch_ids:
@@ -286,12 +354,11 @@ exports.getMyBusiness = async (req, res) => {
   }
 };
 
-// GET ALL BUSINESSES — restricted to admins (see note below)
+// GET ALL BUSINESSES — restricted to admins
 exports.getAllBusinesses = async (req, res) => {
   try {
     const firebase_uid = req.firebase_uid || req.query.firebase_uid;
 
-    // Admin check: users.is_admin column (add it if you don't have it)
     const [adminCheck] = await db.promise().execute(
       `SELECT is_admin FROM users WHERE firebase_uid = ? LIMIT 1`,
       [firebase_uid]
@@ -361,7 +428,7 @@ exports.updateMyBusiness = async (req, res) => {
 
 // ==================== BRANCH CONTROLLERS ====================
 
-// CREATE BRANCH — owner only
+// CREATE BRANCH — owner only, enforces plan branch limit
 exports.createBranch = async (req, res) => {
   const connection = await db.promise().getConnection();
   try {
@@ -376,6 +443,42 @@ exports.createBranch = async (req, res) => {
       return res.status(403).json({ message: 'Only the business owner can create branches' });
     }
 
+    // ── Plan limit check ────────────────────────────────────
+    const plan = await getActivePlanForUser(connection, firebase_uid);
+
+    if (!plan) {
+      return res.status(403).json({
+        message: 'An active subscription is required to create branches',
+        code: 'NO_ACTIVE_SUBSCRIPTION',
+      });
+    }
+
+    const limit = getPlanBranchLimit(plan);
+
+    if (limit === 0) {
+      return res.status(403).json({
+        message: 'Your current plan does not allow branch creation. Upgrade to continue.',
+        code: 'PLAN_LIMIT_REACHED',
+      });
+    }
+
+    if (limit !== Infinity) {
+      const [countRows] = await connection.execute(
+        `SELECT COUNT(*) AS count FROM branches WHERE business_id = ?`,
+        [business_id]
+      );
+
+      if (countRows[0].count >= limit) {
+        return res.status(403).json({
+          message: `Your ${plan.name} plan allows only ${limit} branch${limit === 1 ? '' : 'es'}. Upgrade to add more.`,
+          code: 'PLAN_LIMIT_REACHED',
+          limit,
+          current: countRows[0].count,
+        });
+      }
+    }
+
+    // ── Create branch ───────────────────────────────────────
     await connection.beginTransaction();
 
     const [result] = await connection.execute(
@@ -386,6 +489,7 @@ exports.createBranch = async (req, res) => {
 
     const branchId = result.insertId;
 
+    // Set as primary only if user has no branch yet
     await connection.execute(
       `UPDATE users SET branch_id = COALESCE(branch_id, ?) WHERE firebase_uid = ?`,
       [branchId, firebase_uid]
@@ -407,6 +511,7 @@ exports.createBranch = async (req, res) => {
     });
   } catch (error) {
     try { await connection.rollback(); } catch (_) {}
+    console.error('createBranch ERROR:', error);
     res.status(500).json({ message: error.message });
   } finally {
     connection.release();
