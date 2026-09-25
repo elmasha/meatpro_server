@@ -1,4 +1,4 @@
-// routes/admin.js
+// routes/adminRoutes.js
 const express = require('express');
 const router = express.Router();
 const { requireAdmin, requireRole } = require('../middleware/adminAuth');
