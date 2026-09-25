@@ -101,7 +101,7 @@ async function notifySuperAdmins(changeRequestId, code, action, maker, payloadSu
     return;
   }
 
-  const link = `https://app.meatpro.co/admin/approve?code=${code}`;
+  const link = `https://meatpro-app.netlify.app/admin/approve?code=${code}`;
 
   // Maker's display name falls back to email or 'Admin'
   const makerName = maker?.name || maker?.email || 'An admin';
