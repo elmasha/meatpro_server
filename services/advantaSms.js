@@ -1,5 +1,5 @@
 // services/advantaSms.js
-const fetch = require('node-fetch'); // if Node < 18; otherwise remove this line
+const axios = require('axios');
 
 const ADVANTA_BASE = process.env.ADVANTA_BASE || 'https://quicksms.advantasms.com';
 const ADVANTA_API_KEY = process.env.ADVANTA_API_KEY;
@@ -31,18 +31,23 @@ async function sendSms(mobile, message) {
   };
 
   try {
-    const r = await fetch(`${ADVANTA_BASE}/api/services/sendsms`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const r = await axios.post(
+      `${ADVANTA_BASE}/api/services/sendsms`,
+      body,
+      {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 15000,           // 15s timeout — never hang
+        validateStatus: () => true, // treat 4xx/5xx as data, not thrown errors
+      }
+    );
 
-    const text = await r.text();
-    let data;
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    const data = r.data;
 
-    if (!r.ok) {
-      return { ok: false, error: `HTTP ${r.status}: ${text.slice(0, 200)}` };
+    if (r.status < 200 || r.status >= 300) {
+      const errText = typeof data === 'string'
+        ? data.slice(0, 200)
+        : JSON.stringify(data).slice(0, 200);
+      return { ok: false, error: `HTTP ${r.status}: ${errText}` };
     }
 
     // Advanta returns { responses: [{ "respose-code": 200, "response-description": "Success", ... }] }
@@ -53,10 +58,16 @@ async function sendSms(mobile, message) {
     return {
       ok,
       ref: first?.messageid || first?.['message-id'] || null,
-      error: ok ? undefined : (first?.['response-description'] || JSON.stringify(data).slice(0, 200)),
+      error: ok
+        ? undefined
+        : (first?.['response-description'] || JSON.stringify(data).slice(0, 200)),
     };
   } catch (e) {
-    return { ok: false, error: String(e).slice(0, 200) };
+    // axios throws on network errors, timeouts, DNS failures, etc.
+    const detail = e.response
+      ? `HTTP ${e.response.status}`
+      : (e.code || e.message || 'unknown');
+    return { ok: false, error: `Request failed: ${detail}` };
   }
 }
 
