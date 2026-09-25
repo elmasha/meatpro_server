@@ -1,7 +1,7 @@
 // services/changeRequest.js
 const crypto = require('crypto');
 const db = require('../config/db');
-const { sendSms } = require('./advantaSms');
+const { sendSms } = require('../services/advantaSms');
 
 // Unambiguous alphabet: no 0/O, 1/I/L
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
@@ -101,8 +101,7 @@ async function notifySuperAdmins(changeRequestId, code, action, maker, payloadSu
     return;
   }
 
-  const base = process.env.ADMIN_APP_URL || 'https://app.meatpro.co';
-  const link = `${base}/admin/approve?code=${code}`;
+  const link = `https://app.meatpro.co/admin/approve?code=${code}`;
 
   // Maker's display name falls back to email or 'Admin'
   const makerName = maker?.name || maker?.email || 'An admin';

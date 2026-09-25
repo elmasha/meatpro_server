@@ -45,7 +45,7 @@ async function sendSms(mobile, message) {
 
   try {
     const r = await axios.post(
-      `${ADVANTA_BASE}/api/services/sendsms`,
+      `https://quicksms.advantasms.com/api/services/sendsms`,
       body,
       {
         headers: { 'Content-Type': 'application/json' },
@@ -95,7 +95,7 @@ async function getSmsBalance() {
 
   try {
     const r = await axios.post(
-      `${ADVANTA_BASE}/api/services/getbalance`,
+      `https://quicksms.advantasms.com/api/services/getbalance`,
       {
         apikey: ADVANTA_API_KEY,
         partnerID: ADVANTA_PARTNER_ID,
