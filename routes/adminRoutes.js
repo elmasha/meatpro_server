@@ -37,5 +37,7 @@ router.get('/businesses/:business_id/branches', admin.getBusinessBranches);
 router.get('/change-requests', requireRole('super_admin'), admin.getPendingChangeRequests);
 router.get('/change-requests/:code', requireRole('super_admin'), admin.getChangeRequestByCode);
 router.post('/change-requests/:code/decide', requireRole('super_admin'), admin.decideChangeRequest);
-
+router.post('/users/:id/send-password-reset',
+  requireRole('super_admin'),
+  admin.sendPasswordReset);
 module.exports = router;

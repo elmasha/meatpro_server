@@ -1034,3 +1034,82 @@ exports.decideChangeRequest = async (req, res) => {
     conn.release();
   }
 };
+
+// ============================================================
+// Send a password-reset email on behalf of a user
+// Super-admin only (enforced in routes)
+// ============================================================
+exports.sendPasswordReset = async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const admin = require('../config/firebaseAdmin');
+
+    // 1. Find the user
+    const [rows] = await db.promise().query(
+      'SELECT id, name, email, firebase_uid FROM users WHERE id = ? LIMIT 1',
+      [id]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const user = rows[0];
+
+    if (!user.email) {
+      return res.status(400).json({ error: 'User has no email on file' });
+    }
+
+    // 2. Ask Firebase to send the password reset email
+    //    Firebase uses its own email template, configured in
+    //    Firebase Console → Authentication → Templates → Password reset.
+    await admin.auth().generatePasswordResetLink(user.email);
+
+    // Note: generatePasswordResetLink only *generates* a link; it does NOT
+    // send the email. To actually send, use the Firebase REST API's
+    // sendOobCode endpoint (see the alternative below).
+
+    // Best approach: use the REST API to send the email directly.
+    // (Firebase Admin SDK doesn't have a send-email method; we call REST.)
+    const FIREBASE_API_KEY = process.env.FIREBASE_WEB_API_KEY;
+    if (!FIREBASE_API_KEY) {
+      return res.status(500).json({
+        error: 'FIREBASE_WEB_API_KEY not configured on the server. Add it to env vars.'
+      });
+    }
+
+    const axios = require('axios');
+    const payload = {
+      requestType: 'PASSWORD_RESET',
+      email: user.email,
+    };
+
+    const r = await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${FIREBASE_API_KEY}`,
+      payload,
+      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+    );
+
+    // 3. Audit log
+    await audit({
+      admin: req.admin,
+      action: 'user.passwordReset',
+      targetType: 'user',
+      targetId: id,
+      payload: { user_id: id, email: user.email },
+      req,
+    });
+
+    res.json({
+      success: true,
+      message: `Password reset email sent to ${user.email}`,
+      email: user.email,
+    });
+  } catch (err) {
+    console.error('[sendPasswordReset]', err.response?.data || err.message);
+    const fbErr = err.response?.data?.error?.message;
+    if (fbErr === 'EMAIL_NOT_FOUND') {
+      return res.status(404).json({ error: 'Firebase has no account with that email' });
+    }
+    res.status(500).json({ error: err.message });
+  }
+};
