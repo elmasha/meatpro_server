@@ -3,20 +3,8 @@ const db = require('../config/db');
 
 exports.requireAdmin = async (req, res, next) => {
   try {
-    // Accept identity from either header
-    let firebaseUid = req.headers['x-firebase-uid'];
-
-    if (!firebaseUid && req.headers.authorization) {
-      // If the frontend sent a Bearer token, we can't verify it without firebase-admin,
-      // so we just log a warning. Fall back to x-firebase-uid if present.
-      // If the frontend ONLY sends Bearer, you MUST install firebase-admin and
-      // use verifyIdToken() here — but for now, if there's no x-firebase-uid,
-      // try the query param.
-    }
-
-    if (!firebaseUid) {
-      firebaseUid = req.query.uid;
-    }
+    // Accept identity from x-firebase-uid header OR ?uid= query param
+    let firebaseUid = req.headers['x-firebase-uid'] || req.query.uid;
 
     if (!firebaseUid) {
       return res.status(401).json({
@@ -42,13 +30,15 @@ exports.requireAdmin = async (req, res, next) => {
       return res.status(403).json({ error: 'Admin access required' });
     }
 
+    // *** THIS IS THE CRITICAL LINE ***
+    // Without it, req.admin is undefined and every controller crashes
     req.admin = {
       id: u.id,
       uid: u.firebase_uid,
       name: u.name,
       email: u.email,
       phone: u.phone,
-      role: u.admin_role,
+      role: u.admin_role,   // 'super_admin' or 'admin'
     };
     req.firebaseUid = u.firebase_uid;
 
