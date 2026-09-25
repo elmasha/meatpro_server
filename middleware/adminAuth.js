@@ -1,24 +1,35 @@
 // middleware/adminAuth.js
 const db = require('../config/db');
+const admin = require('../config/firebaseAdmin');
 
 /**
- * Resolve the caller's identity from x-firebase-uid header (or ?uid query param).
- * Loads the user row and enforces is_admin + admin_role.
- *
- * NOTE: This uses the raw firebase_uid header for speed during development.
- * Phase 9 will swap this for Firebase ID-token verification — the only thing
- * that changes is how `firebaseUid` is obtained. Everything below stays the same.
+ * Verify the caller's Firebase ID token, then load their admin row.
+ * Reads: Authorization: Bearer <idToken>
+ * Sets:  req.admin = { id, uid, name, email, phone, role }
  */
 exports.requireAdmin = async (req, res, next) => {
   try {
-    const firebaseUid = req.headers['x-firebase-uid'] || req.query.uid;
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
-    if (!firebaseUid) {
+    if (!token) {
       return res.status(401).json({
-        error: 'Authentication required. Provide x-firebase-uid header.'
+        error: 'Authentication required. Provide Authorization: Bearer <idToken>.'
       });
     }
 
+    // 1. Verify token with Firebase
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(token);
+    } catch (e) {
+      console.warn('[requireAdmin] invalid token:', e.code || e.message);
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    const firebaseUid = decoded.uid;
+
+    // 2. Load the user row
     const [rows] = await db.promise().query(
       `SELECT id, firebase_uid, name, email, phone, is_admin, admin_role
          FROM users
@@ -37,17 +48,15 @@ exports.requireAdmin = async (req, res, next) => {
       return res.status(403).json({ error: 'Admin access required' });
     }
 
-    // Attach a normalised admin object for downstream handlers
+    // 3. Attach normalised admin object
     req.admin = {
       id: u.id,
       uid: u.firebase_uid,
       name: u.name,
       email: u.email,
       phone: u.phone,
-      role: u.admin_role,   // 'viewer' | 'admin' | 'super_admin'
+      role: u.admin_role, // 'viewer' | 'admin' | 'super_admin'
     };
-
-    // Backwards-compat: some of your existing handlers read req.firebaseUid
     req.firebaseUid = u.firebase_uid;
 
     next();
@@ -59,8 +68,6 @@ exports.requireAdmin = async (req, res, next) => {
 
 /**
  * Role gate. Use after requireAdmin.
- *   router.post('/x', requireAdmin, requireRole('super_admin'), handler)
- *   router.post('/y', requireAdmin, requireRole('admin', 'super_admin'), handler)
  */
 exports.requireRole = (...roles) => (req, res, next) => {
   if (!req.admin) {
@@ -75,12 +82,16 @@ exports.requireRole = (...roles) => (req, res, next) => {
 };
 
 /**
- * Write a row into admin_audit_log. Fire-and-forget — never throws.
- * Call this from any admin handler that mutates state.
+ * Write a row into admin_audit_log. Fire-and-forget.
  */
 exports.audit = async ({
-  admin, action, targetType, targetId, payload,
-  changeRequestId = null, req
+  admin,
+  action,
+  targetType,
+  targetId,
+  payload,
+  changeRequestId = null,
+  req,
 }) => {
   try {
     await db.promise().query(
