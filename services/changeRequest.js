@@ -15,14 +15,14 @@ function generateRequestCode(len = 6) {
 }
 
 /**
- * Build a short SMS summary for the request.
+ * Short SMS summary for the request.
  */
 function summarise(action, payload) {
   switch (action) {
     case 'plan.create':
       return `new plan "${payload.display_name}" @ KES ${payload.price_kes}`;
     case 'plan.update':
-      return `edit plan #${payload.id || '?'} (${payload.display_name || 'name unchanged'}) price→${payload.price_kes ?? 'unchanged'}`;
+      return `edit plan #${payload.id || '?'} (${payload.display_name || 'name unchanged'}) price->${payload.price_kes ?? 'unchanged'}`;
     case 'plan.delete':
       return `DELETE plan #${payload.id}`;
     case 'plan.toggle':
@@ -47,49 +47,109 @@ function summarise(action, payload) {
 }
 
 /**
- * Notify all super_admins via SMS and log each attempt.
+ * Write a row to admin_sms_log. Never throws — logs and moves on.
  */
-async function notifySuperAdmins(changeRequestId, code, action, maker, payloadSummary) {
-  const [supers] = await db.promise().query(
-    `SELECT name, phone FROM users
-      WHERE admin_role = 'super_admin'
-        AND is_admin = 1
-        AND phone IS NOT NULL`
-  );
-
-  if (!supers.length) {
-    console.warn('[changeRequest] No super_admin with phone found — nobody notified. Request is still queued.');
+async function logSmsRow(row) {
+  try {
     await db.promise().query(
       `INSERT INTO admin_sms_log
-         (change_request_id, recipient_phone, message, provider, status, error)
-       VALUES (?, ?, ?, ?, 'failed', ?)`,
-      [changeRequestId, 'NONE', `No super_admin found for request ${code}`, 'advanta',
-       'No super_admin with phone found']
+         (change_request_id, recipient_phone, message, provider, provider_ref, status, error)
+       VALUES (?,?,?,?,?,?,?)`,
+      [
+        row.changeRequestId,
+        row.phone,
+        row.message,
+        'advanta',
+        row.ref || null,
+        row.status,
+        row.error || null,
+      ]
     );
+  } catch (e) {
+    console.error('[changeRequest] admin_sms_log insert failed:', e.message);
+  }
+}
+
+/**
+ * Notify every super_admin by SMS. Never throws.
+ */
+async function notifySuperAdmins(changeRequestId, code, action, maker, payloadSummary) {
+  let supers = [];
+  try {
+    const [rows] = await db.promise().query(
+      `SELECT name, phone
+         FROM users
+        WHERE admin_role = 'super_admin'
+          AND is_admin = 1
+          AND phone IS NOT NULL`
+    );
+    supers = rows;
+  } catch (e) {
+    console.error('[changeRequest] failed to load super_admins:', e.message);
+    return;
+  }
+
+  if (!supers.length) {
+    console.warn('[changeRequest] no super_admin with phone found — nobody notified');
+    await logSmsRow({
+      changeRequestId,
+      phone: 'NONE',
+      message: `No super_admin found for request ${code}`,
+      status: 'failed',
+      error: 'No super_admin with phone found',
+    });
     return;
   }
 
   const base = process.env.ADMIN_APP_URL || 'https://app.meatpro.co';
   const link = `${base}/admin/approve?code=${code}`;
-  const msg = `MeatPro: ${maker.name} requests ${action}. ${payloadSummary}. Code ${code} (15min). Approve: ${link}`;
+
+  // Maker's display name falls back to email or 'Admin'
+  const makerName = maker?.name || maker?.email || 'An admin';
+
+  // Keep the SMS body short & clean
+  const msg =
+    `MeatPro: ${makerName} requests ${action}. ` +
+    `${payloadSummary}. ` +
+    `Code ${code} (15 min). Approve: ${link}`;
 
   for (const s of supers) {
-    const r = await sendSms(s.phone, msg);
-    await db.promise().query(
-      `INSERT INTO admin_sms_log
-         (change_request_id, recipient_phone, message, provider, provider_ref, status, error)
-       VALUES (?,?,?,?,?,?,?)`,
-      [changeRequestId, s.phone, msg, 'advanta', r.ref || null,
-       r.ok ? 'sent' : 'failed', r.ok ? null : (r.error || null)]
+    let result = { ok: false, error: 'send failed' };
+    try {
+      result = await sendSms(s.phone, msg);
+    } catch (e) {
+      result = { ok: false, error: String(e).slice(0, 200) };
+    }
+
+    console.log(
+      `[changeRequest] SMS to ${s.phone} (${s.name || '?'}):`,
+      result.ok ? `OK ref=${result.ref}` : `FAIL ${result.error}`
     );
-    if (r.ok) {
-      await db.promise().query(
-        `UPDATE admin_change_requests SET sms_sent_at = NOW(), sms_provider_ref = ? WHERE id = ?`,
-        [r.ref, changeRequestId]
-      );
+
+    await logSmsRow({
+      changeRequestId,
+      phone: s.phone,
+      message: msg,
+      ref: result.ref,
+      status: result.ok ? 'sent' : 'failed',
+      error: result.ok ? null : result.error,
+    });
+
+    if (result.ok) {
+      try {
+        await db.promise().query(
+          `UPDATE admin_change_requests
+              SET sms_sent_at = NOW(), sms_provider_ref = ?
+            WHERE id = ?`,
+          [result.ref, changeRequestId]
+        );
+      } catch (e) {
+        console.error('[changeRequest] failed to update sms_sent_at:', e.message);
+      }
     }
   }
 }
+
 /**
  * Insert a pending change request and notify super admins.
  * Returns { id, request_code, expires_at }.
@@ -104,16 +164,23 @@ async function queueChangeRequest({ req, action, targetType, targetId, before, a
         payload_before, payload_after, expires_at, ip_address, user_agent)
      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
     [
-      code, req.admin.uid, req.admin.email, action, targetType,
+      code,
+      req.admin.uid,
+      req.admin.email,
+      action,
+      targetType,
       targetId != null ? String(targetId) : null,
       before ? JSON.stringify(before) : null,
       JSON.stringify(after),
       expiresAt,
-      req.ip, (req.get('user-agent') || '').slice(0, 255),
+      req.ip,
+      (req.get('user-agent') || '').slice(0, 255),
     ]
   );
 
   const summary = summarise(action, after);
+
+  // Await so caller sees 202 only after SMS attempt has been made
   await notifySuperAdmins(result.insertId, code, action, req.admin, summary);
 
   return { id: result.insertId, request_code: code, expires_at: expiresAt };
@@ -131,7 +198,8 @@ async function applyChange(conn, r) {
   switch (r.action) {
     case 'plan.create': {
       const featuresJson = Array.isArray(p.features)
-        ? JSON.stringify(p.features) : (p.features ?? null);
+        ? JSON.stringify(p.features)
+        : (p.features ?? null);
       await conn.query(
         `INSERT INTO plans (name, display_name, price_kes, billing_cycle, description, features, is_active)
          VALUES (?,?,?,?,?,?,1)`,
@@ -142,7 +210,8 @@ async function applyChange(conn, r) {
     }
     case 'plan.update': {
       const before = typeof r.payload_before === 'string'
-        ? JSON.parse(r.payload_before) : (r.payload_before || {});
+        ? JSON.parse(r.payload_before)
+        : (r.payload_before || {});
       const updates = []; const values = [];
       for (const k of ['display_name', 'price_kes', 'billing_cycle', 'description']) {
         if (p[k] !== undefined) { updates.push(`${k} = ?`); values.push(p[k]); }
@@ -177,14 +246,17 @@ async function applyChange(conn, r) {
         [receipt, r.target_id]
       );
       await conn.query(
-        `UPDATE subscriptions SET status = 'active', start_date = CURDATE(),
-                end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH), mpesa_receipt = ?
+        `UPDATE subscriptions
+            SET status = 'active', start_date = CURDATE(),
+                end_date = DATE_ADD(CURDATE(), INTERVAL 1 MONTH),
+                mpesa_receipt = ?
           WHERE user_id = ? AND status = 'pending'
           ORDER BY id DESC LIMIT 1`,
         [receipt, payment.user_id]
       );
       await conn.query(
-        `UPDATE users SET subscription = ?, subscription_status = 'active',
+        `UPDATE users
+            SET subscription = ?, subscription_status = 'active',
                 subscription_expires = DATE_ADD(CURDATE(), INTERVAL 1 MONTH),
                 mpesa_receipt = ?, payment_date = NOW()
           WHERE id = ?`,
