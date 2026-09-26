@@ -1029,16 +1029,11 @@ exports.decideChangeRequest = async (req, res) => {
 
 // ============================================================
 // SEND PASSWORD RESET (super-admin only)
-//
-// Uses the Firebase REST API directly. No Firebase Admin SDK here —
-// the Admin SDK credentials were the source of "invalid_grant".
-// The Web API key is sufficient for sending the password reset email.
 // ============================================================
 exports.sendPasswordReset = async (req, res) => {
   const { id } = req.params;
 
   try {
-    // 1. Find the user
     const [rows] = await db.promise().query(
       'SELECT id, name, email FROM users WHERE id = ? LIMIT 1',
       [id]
@@ -1052,7 +1047,7 @@ exports.sendPasswordReset = async (req, res) => {
       return res.status(400).json({ error: 'User has no email on file' });
     }
 
-    // 2. Rate-limit: don't allow more than one reset per 2 minutes per user
+    // Rate-limit: 2 minutes per user
     const twoMinAgo = new Date(Date.now() - 2 * 60 * 1000);
     const [recent] = await db.promise().query(
       `SELECT id FROM admin_audit_log
@@ -1068,7 +1063,6 @@ exports.sendPasswordReset = async (req, res) => {
       });
     }
 
-    // 3. Call Firebase REST API to send the password reset email
     const FIREBASE_API_KEY = process.env.FIREBASE_WEB_API_KEY;
     if (!FIREBASE_API_KEY) {
       return res.status(500).json({
@@ -1079,9 +1073,8 @@ exports.sendPasswordReset = async (req, res) => {
     const axios = require('axios');
     const url = `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${FIREBASE_API_KEY}`;
 
-    let fbResponse;
     try {
-      fbResponse = await axios.post(
+      await axios.post(
         url,
         { requestType: 'PASSWORD_RESET', email: user.email },
         { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
@@ -1111,7 +1104,6 @@ exports.sendPasswordReset = async (req, res) => {
       return res.status(500).json({ error: `Firebase: ${fbMsg}` });
     }
 
-    // 4. Audit log
     await audit({
       admin: req.admin,
       action: 'user.passwordReset',
@@ -1128,6 +1120,124 @@ exports.sendPasswordReset = async (req, res) => {
     });
   } catch (err) {
     console.error('[sendPasswordReset]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// ============================================================
+// SMS BALANCE (super-admin only)
+// ============================================================
+exports.getSmsBalance = async (req, res) => {
+  try {
+    const { getSmsBalance } = require('../services/advantaSms');
+
+    const result = await getSmsBalance();
+
+    if (!result.ok) {
+      const reason = result.reason || result.error || 'Unknown error';
+      if (reason === 'NOT_CONFIGURED') {
+        return res.status(500).json({
+          error: 'Advanta credentials not configured on the server.',
+        });
+      }
+      return res.status(502).json({ error: `Advanta: ${reason}` });
+    }
+
+    res.json({
+      success: true,
+      balance: result.balance,
+      currency: result.currency || 'KES',
+      checked_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('[getSmsBalance]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// ============================================================
+// SEND CUSTOM SMS TO A USER (super-admin only)
+// ============================================================
+exports.sendSmsToUser = async (req, res) => {
+  const { id } = req.params;
+  const { to, message } = req.body;
+
+  try {
+    if (!message || !String(message).trim()) {
+      return res.status(400).json({ error: 'message is required' });
+    }
+    const trimmed = String(message).trim();
+    if (trimmed.length > 480) {
+      return res.status(400).json({ error: 'message too long (max 480 chars)' });
+    }
+
+    const [rows] = await db.promise().query(
+      'SELECT id, name, phone, email FROM users WHERE id = ? LIMIT 1',
+      [id]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const user = rows[0];
+
+    const destination = to || user.phone;
+    if (!destination) {
+      return res.status(400).json({
+        error: 'No phone number on file for this user. Provide `to` in the request.',
+      });
+    }
+
+    // 2-minute rate limit per user
+    const twoMinAgo = new Date(Date.now() - 2 * 60 * 1000);
+    const [recent] = await db.promise().query(
+      `SELECT id FROM admin_audit_log
+        WHERE action = 'user.sendSms'
+          AND target_id = ?
+          AND created_at >= ?
+        LIMIT 1`,
+      [String(id), twoMinAgo]
+    );
+    if (recent.length) {
+      return res.status(429).json({
+        error: 'An SMS was just sent to this user. Wait 2 minutes before retrying.',
+      });
+    }
+
+    const { sendSms } = require('../services/advantaSms');
+    const result = await sendSms(destination, trimmed);
+
+    await audit({
+      admin: req.admin,
+      action: 'user.sendSms',
+      targetType: 'user',
+      targetId: id,
+      payload: {
+        user_id: id,
+        to: destination,
+        message: trimmed.slice(0, 200),
+        ok: !!result.ok,
+        ref: result.ref || null,
+        error: result.ok ? null : (result.error || 'unknown'),
+      },
+      req,
+    });
+
+    if (!result.ok) {
+      console.error('[sendSmsToUser] Advanta error:', result.error);
+      return res.status(502).json({
+        error: result.error || 'SMS provider rejected the message',
+        to: destination,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `SMS sent to ${destination}`,
+      to: destination,
+      ref: result.ref || null,
+    });
+  } catch (err) {
+    console.error('[sendSmsToUser]', err.message);
     res.status(500).json({ error: err.message });
   }
 };

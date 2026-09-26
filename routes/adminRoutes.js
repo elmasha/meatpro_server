@@ -40,4 +40,13 @@ router.post('/change-requests/:code/decide', requireRole('super_admin'), admin.d
 router.post('/users/:id/send-password-reset',
   requireRole('super_admin'),
   admin.sendPasswordReset);
+
+// SMS tools — super-admin only
+router.get('/sms/balance',
+  requireRole('super_admin'),
+  admin.getSmsBalance);
+
+router.post('/users/:id/send-sms',
+  requireRole('super_admin'),
+  admin.sendSmsToUser);  
 module.exports = router;
