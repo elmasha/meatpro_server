@@ -4,8 +4,8 @@ const redis = require('../config/redis');
 
 const router = express.Router();
 const dailyOps = require('../controllers/dailyOperationController');
-const expenses = require('../controllers/expenseController');
-const reports = require('../controllers/reportController');
+const expenses = require('../controllers/expenseController'); // Contains the report logic now
+const reports = require('../controllers/reportController'); // If you still have this file
 const stock = require('../controllers/stockController');
 
 // ─────────────────────────────────────────────────────────────
@@ -55,7 +55,6 @@ router.get('/daily-operations', async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // PATCH /daily-operations/:branch_id/:date — BLOCKED
-// Entries are immutable once saved. No payment updates allowed.
 // ─────────────────────────────────────────────────────────────
 router.patch('/daily-operations/:branch_id/:date', async (req, res) => {
   return res.status(405).json({
@@ -70,18 +69,27 @@ router.patch('/daily-operations/:branch_id/:date', async (req, res) => {
 router.post('/daily-operations', dailyOps.createOrUpdateDailyOperation);
 router.get('/daily-operations/last', dailyOps.getLastEntry);
 
-// Expenses
+// =========================
+// EXPENSES (and Reports in expenseController)
+// =========================
 router.post('/expenses', expenses.createExpense);
 router.get('/expenses/:date', expenses.getExpensesByDate);
-router.patch('/expenses/:id', expenses.updateExpense);   // if you need it
-router.delete('/expenses/:id', expenses.deleteExpense);  // if you need it
+router.patch('/expenses/:id', expenses.updateExpense);
+router.delete('/expenses/:id', expenses.deleteExpense);
 
-// Reports
-router.get('/reports/last-entry', reports.getLastEntryReport);
-router.get('/reports/last-7-days', reports.getLast7DaysReport);
-router.get('/reports/month-to-date', reports.getMonthToDateReport);
+// =========================
+// REPORTS (Point to expenses.get..., NOT reports.get...)
+// =========================
+router.get('/reports/last-7-days', expenses.getLast7DaysReport);
+router.get('/reports/month-to-date', expenses.getMonthToDateReport);
 
-// Stock
+// If you still have these in reportController, keep them here:
+// router.get('/reports/last-entry', reports.getLastEntryReport);
+// router.get('/reports/comparative', reports.getComparative);
+
+// =========================
+// STOCK
+// =========================
 router.get('/stock/current', stock.getCurrentStock);
 
 module.exports = router;

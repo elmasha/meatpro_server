@@ -12,6 +12,7 @@ const invalidateDailyCache = async (branch_id, date) => {
     `report:last-entry:${branch_id || 'all'}`,
     `report:last-7-days:${branch_id || 'all'}`,
     `report:month-to-date:${branch_id || 'all'}`,
+    `report:comparative:${branch_id || 'all'}`,
     `daily:last:${branch_id || 'all'}`
   ];
   for (const key of keys) {
