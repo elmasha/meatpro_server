@@ -179,6 +179,100 @@ exports.updateExpense = async (req, res) => {
   }
 };
 
+
+exports.getLast7DaysReport = async (req, res) => {
+  try {
+    const { branch_id } = req.query;
+
+    // 1. Get Daily Entries (Your existing logic)
+    const [rows] = await db.promise().query(`
+      SELECT 
+        date,
+        SUM(actual_revenue) AS daily_actual_revenue,
+        SUM(cogs) AS daily_cogs
+      FROM daily_entries
+      WHERE branch_id = ? AND date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+      GROUP BY date
+    `, [branch_id]);
+
+    // 2. Calculate Totals
+    let totalActualRevenue = 0;
+    let totalCogs = 0;
+    rows.forEach(row => {
+      totalActualRevenue += parseFloat(row.daily_actual_revenue) || 0;
+      totalCogs += parseFloat(row.daily_cogs) || 0;
+    });
+
+    // 3. NEW: Get Total Expenses for the last 7 days
+    const [[expenseSum]] = await db.promise().query(`
+      SELECT COALESCE(SUM(amount), 0) AS total_expenses 
+      FROM expenses 
+      WHERE branch_id = ? AND date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+    `, [branch_id]);
+
+    const totalExpenses = parseFloat(expenseSum.total_expenses) || 0;
+
+    // 4. Return the JSON with the totalCost (Expenses only)
+    res.json({
+      totalActualRevenue: totalActualRevenue,
+      totalCogs: totalCogs,
+      totalCost: totalExpenses, // <-- Android will read this!
+      data: rows
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+
+
+exports.getMonthToDateReport = async (req, res) => {
+  try {
+    const { branch_id } = req.query;
+
+    // 1. Get Daily Entries (Your existing logic)
+    const [rows] = await db.promise().query(`
+      SELECT 
+        date,
+        SUM(actual_revenue) AS daily_actual_revenue,
+        SUM(cogs) AS daily_cogs
+      FROM daily_entries
+      WHERE branch_id = ? AND date >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+      GROUP BY date
+    `, [branch_id]);
+
+    // 2. Calculate Totals
+    let totalActualRevenue = 0;
+    let totalCogs = 0;
+    rows.forEach(row => {
+      totalActualRevenue += parseFloat(row.daily_actual_revenue) || 0;
+      totalCogs += parseFloat(row.daily_cogs) || 0;
+    });
+
+    // 3. NEW: Get Total Expenses for the month
+    const [[expenseSum]] = await db.promise().query(`
+      SELECT COALESCE(SUM(amount), 0) AS total_expenses 
+      FROM expenses 
+      WHERE branch_id = ? AND date >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+    `, [branch_id]);
+
+    const totalExpenses = parseFloat(expenseSum.total_expenses) || 0;
+
+    // 4. Return the JSON with the totalCost
+    res.json({
+      totalActualRevenue: totalActualRevenue,
+      totalCogs: totalCogs,
+      totalCost: totalExpenses, // <-- Android will read this!
+      data: rows
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+
 // ─────────────────────────────────────────────────────────────
 // DELETE EXPENSE — blocked if the day is already closed
 // (Optional — only if you have a delete-expense route)
