@@ -1,10 +1,7 @@
 const db = require("../config/db");
 const redis = require('../config/redis');
 
-// ===== REPORTS CONTROLLER — OPTION B =====
-// Net Profit = Revenue - Expenses only (COGS is NOT subtracted)
-
-// Helper: get live expenses for a date range
+// Helper: Get live expenses for a specific date range
 const getLiveExpenses = async (startDate, endDate, branch_id) => {
   let query = `
     SELECT COALESCE(SUM(amount), 0) as total 
@@ -22,10 +19,30 @@ const getLiveExpenses = async (startDate, endDate, branch_id) => {
   return parseFloat(rows[0].total) || 0;
 };
 
-// GET /reports/last-entry — OPTION B: profit = revenue - expenses
+// Helper to clear reports cache when a new entry/expense is added
+const invalidateReportCache = async (branch_id) => {
+  const keys = [
+    `report:last-entry:${branch_id || 'all'}`,
+    `report:last-7-days:${branch_id || 'all'}`,
+    `report:month-to-date:${branch_id || 'all'}`,
+    `report:comparative:${branch_id || 'all'}`,
+    `report:profitability:${branch_id || 'all'}`,
+    `report:payment-mix:${branch_id || 'all'}`,
+    `report:expense-breakdown:${branch_id || 'all'}`
+  ];
+  for (const key of keys) { await redis.del(key); }
+};
+
+// ─────────────────────────────────────────────────────────────
+// GET /reports/last-entry
+// ─────────────────────────────────────────────────────────────
 exports.getLastEntryReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
+    const cacheKey = `report:last-entry:${branch_id || 'all'}`;
+    
+    const cached = await redis.get(cacheKey);
+    if (cached) return res.status(200).json(JSON.parse(cached));
 
     let query = `SELECT * FROM daily_entries ORDER BY date DESC, id DESC LIMIT 1`;
     const params = [];
@@ -48,23 +65,21 @@ exports.getLastEntryReport = async (req, res) => {
     const actualRevenue = paymentCash + paymentMpesa;
     const cogs = (parseFloat(entry.sold_kg) || 0) * (parseFloat(entry.cost_per_kg) || 0);
 
-    // Fetch LIVE expenses
     const totalExpenses = await getLiveExpenses(entry.date, entry.date, entry.branch_id);
 
-    // ✅ OPTION B: Profit = Revenue - Expenses only (COGS NOT subtracted)
     const actualProfit = actualRevenue - totalExpenses;
     const expectedProfit = expectedRevenue - totalExpenses;
     const revenueVariance = expectedRevenue - actualRevenue;
     const marginPct = actualRevenue > 0 ? ((actualProfit / actualRevenue) * 100).toFixed(1) : 0;
 
-    res.status(200).json({
+    const result = {
       ...entry,
       expectedRevenue,
       actualRevenue,
-      cogs,                          // COGS shown for info but NOT subtracted from profit
-      totalCost: totalExpenses,       // ✅ Total Cost = expenses only
-      totalExpenses,                 // Live expenses
-      actualProfit,                  // ✅ Revenue - Expenses only
+      cogs,                          
+      totalCost: totalExpenses,       
+      totalExpenses,                 
+      actualProfit,                  
       expectedProfit,
       expectedMargin: expectedRevenue > 0 ? ((expectedProfit / expectedRevenue) * 100).toFixed(1) : 0,
       revenueVariance,
@@ -72,17 +87,27 @@ exports.getLastEntryReport = async (req, res) => {
       paymentMpesa,
       netMargin: actualProfit,
       marginPct: parseFloat(marginPct),
-    });
+    };
+
+    await redis.setEx(cacheKey, 300, JSON.stringify(result)); // 5 min cache
+    res.status(200).json(result);
 
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// GET /reports/last-7-days — OPTION B: profit = revenue - expenses
+// ─────────────────────────────────────────────────────────────
+// GET /reports/last-7-days
+// ─────────────────────────────────────────────────────────────
 exports.getLast7DaysReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
+    const cacheKey = `report:last-7-days:${branch_id || 'all'}`;
+
+    const cached = await redis.get(cacheKey);
+    if (cached) return res.status(200).json(JSON.parse(cached));
+
     const endDate = new Date().toISOString().split('T')[0];
     const startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
@@ -108,39 +133,46 @@ exports.getLast7DaysReport = async (req, res) => {
     const [rows] = await db.promise().execute(query, params);
     const ops = rows[0];
 
-    // Fetch LIVE expenses for the period
     const totalExpenses = await getLiveExpenses(startDate, endDate, branch_id);
 
     const totalActualRevenue = parseFloat(ops.totalPayments) || parseFloat(ops.totalActualRevenue) || 0;
     const totalCogs = parseFloat(ops.totalCogs) || 0;
-
-    // ✅ OPTION B: Profit = Revenue - Expenses only (COGS NOT subtracted)
     const actualProfit = totalActualRevenue - totalExpenses;
 
-    res.status(200).json({
+    const result = {
       totalRevenue: parseFloat(ops.totalRevenue) || 0,
       totalActualRevenue,
-      cogs: totalCogs,                        // COGS for info
-      totalCost: totalExpenses,               // ✅ Total Cost = expenses only
+      cogs: totalCogs,                        
+      totalCost: totalExpenses,               
       totalExpenses,
-      totalProfit: actualProfit,              // ✅ Profit = Revenue - Expenses
+      totalProfit: actualProfit,              
       totalSold: parseFloat(ops.totalSold) || 0,
       totalWaste: parseFloat(ops.totalWaste) || 0,
       margin: actualProfit,
       period: 'last-7-days',
       startDate,
       endDate,
-    });
+    };
+
+    await redis.setEx(cacheKey, 600, JSON.stringify(result)); // 10 min cache
+    res.status(200).json(result);
 
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// GET /reports/month-to-date — OPTION B: profit = revenue - expenses
+// ─────────────────────────────────────────────────────────────
+// GET /reports/month-to-date
+// ─────────────────────────────────────────────────────────────
 exports.getMonthToDateReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
+    const cacheKey = `report:month-to-date:${branch_id || 'all'}`;
+
+    const cached = await redis.get(cacheKey);
+    if (cached) return res.status(200).json(JSON.parse(cached));
+
     const now = new Date();
     const startDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
     const endDate = now.toISOString().split('T')[0];
@@ -167,46 +199,51 @@ exports.getMonthToDateReport = async (req, res) => {
     const [rows] = await db.promise().execute(query, params);
     const ops = rows[0];
 
-    // Fetch LIVE expenses for the period
     const totalExpenses = await getLiveExpenses(startDate, endDate, branch_id);
 
     const totalActualRevenue = parseFloat(ops.totalPayments) || parseFloat(ops.totalActualRevenue) || 0;
     const totalCogs = parseFloat(ops.totalCogs) || 0;
-
-    // ✅ OPTION B: Profit = Revenue - Expenses only (COGS NOT subtracted)
     const actualProfit = totalActualRevenue - totalExpenses;
 
-    res.status(200).json({
+    const result = {
       totalRevenue: parseFloat(ops.totalRevenue) || 0,
       totalActualRevenue,
-      cogs: totalCogs,                        // COGS for info
-      totalCost: totalExpenses,               // ✅ Total Cost = expenses only
+      cogs: totalCogs,                        
+      totalCost: totalExpenses,               
       totalExpenses,
-      totalProfit: actualProfit,              // ✅ Profit = Revenue - Expenses
+      totalProfit: actualProfit,              
       totalSold: parseFloat(ops.totalSold) || 0,
       totalWaste: parseFloat(ops.totalWaste) || 0,
       margin: actualProfit,
       period: 'month-to-date',
       startDate,
       endDate,
-    });
+    };
+
+    await redis.setEx(cacheKey, 600, JSON.stringify(result)); // 10 min cache
+    res.status(200).json(result);
 
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// GET /reports/comparative — OPTION B: profit = revenue - expenses
+// ─────────────────────────────────────────────────────────────
+// GET /reports/comparative
+// ─────────────────────────────────────────────────────────────
 exports.getComparative = async (req, res) => {
   try {
     const { branch_id } = req.query;
+    const cacheKey = `report:comparative:${branch_id || 'all'}`;
+
+    const cached = await redis.get(cacheKey);
+    if (cached) return res.status(200).json(JSON.parse(cached));
+
     const now = new Date();
 
-    // This month
     const thisMonthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
     const thisMonthEnd = now.toISOString().split('T')[0];
 
-    // Last month
     const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
     const lastMonthStart = `${lastMonth.getFullYear()}-${String(lastMonth.getMonth() + 1).padStart(2, '0')}-01`;
     const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().split('T')[0];
@@ -214,7 +251,6 @@ exports.getComparative = async (req, res) => {
     const thisMonthExpenses = await getLiveExpenses(thisMonthStart, thisMonthEnd, branch_id);
     const lastMonthExpenses = await getLiveExpenses(lastMonthStart, lastMonthEnd, branch_id);
 
-    // Get this month data
     let thisQuery = `
       SELECT 
         COALESCE(SUM(revenue), 0) as expected_revenue,
@@ -233,7 +269,6 @@ exports.getComparative = async (req, res) => {
     const [thisRows] = await db.promise().execute(thisQuery, thisParams);
     const thisData = thisRows[0];
 
-    // Get last month data
     let lastQuery = `
       SELECT 
         COALESCE(SUM(revenue), 0) as expected_revenue,
@@ -252,13 +287,12 @@ exports.getComparative = async (req, res) => {
     const [lastRows] = await db.promise().execute(lastQuery, lastParams);
     const lastData = lastRows[0];
 
-    // ✅ OPTION B: Profit = Revenue - Expenses only (COGS NOT subtracted)
     const thisActualProfit = parseFloat(thisData.actual_revenue) - thisMonthExpenses;
     const thisExpectedProfit = parseFloat(thisData.expected_revenue) - thisMonthExpenses;
     const lastActualProfit = parseFloat(lastData.actual_revenue) - lastMonthExpenses;
     const lastExpectedProfit = parseFloat(lastData.expected_revenue) - lastMonthExpenses;
 
-    res.status(200).json({
+    const result = {
       thisMonth: {
         expected_revenue: parseFloat(thisData.expected_revenue) || 0,
         actual_revenue: parseFloat(thisData.actual_revenue) || 0,
@@ -285,7 +319,10 @@ exports.getComparative = async (req, res) => {
         sold: calculateChange(lastData.sold, thisData.sold),
         waste: calculateChange(lastData.avg_waste, thisData.avg_waste),
       }
-    });
+    };
+
+    await redis.setEx(cacheKey, 600, JSON.stringify(result));
+    res.status(200).json(result);
 
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -300,10 +337,17 @@ function calculateChange(oldVal, newVal) {
   return ((newV - old) / old * 100).toFixed(1);
 }
 
-// GET /reports/profitability — OPTION B: profit = revenue - expenses
+// ─────────────────────────────────────────────────────────────
+// GET /reports/profitability
+// ─────────────────────────────────────────────────────────────
 exports.getProfitability = async (req, res) => {
   try {
     const { branch_id, days = 30 } = req.query;
+    const cacheKey = `report:profitability:${branch_id || 'all'}:${days}`;
+
+    const cached = await redis.get(cacheKey);
+    if (cached) return res.status(200).json(JSON.parse(cached));
+
     const endDate = new Date().toISOString().split('T')[0];
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
@@ -333,7 +377,6 @@ exports.getProfitability = async (req, res) => {
 
     const [rows] = await db.promise().execute(query, params);
 
-    // Fetch expenses for each date
     const daily = [];
     for (const row of rows) {
       const [expRows] = await db.promise().execute(
@@ -344,14 +387,13 @@ exports.getProfitability = async (req, res) => {
       const actualRevenue = parseFloat(row.payment_cash || 0) + parseFloat(row.payment_mpesa || 0);
       const cogs = parseFloat(row.cogs) || 0;
 
-      // ✅ OPTION B: Profit = Revenue - Expenses only
       daily.push({
         date: row.date,
         expected_revenue: parseFloat(row.expected_revenue) || 0,
         actual_revenue: actualRevenue,
         cogs,
         expenses,
-        actual_profit: actualRevenue - expenses,           // ✅ Revenue - Expenses
+        actual_profit: actualRevenue - expenses,           
         expected_profit: (parseFloat(row.expected_revenue) || 0) - expenses,
         sold_kg: parseFloat(row.sold_kg) || 0,
         waste_kg: parseFloat(row.waste_kg) || 0,
@@ -360,7 +402,6 @@ exports.getProfitability = async (req, res) => {
       });
     }
 
-    // Day of week analysis
     const dayMap = {};
     for (const d of daily) {
       const dayName = new Date(d.date).toLocaleDateString('en-US', { weekday: 'long' });
@@ -389,17 +430,26 @@ exports.getProfitability = async (req, res) => {
       avg_actual_profit: d.total_actual_profit / d.count,
     }));
 
-    res.status(200).json({ daily, dayOfWeek });
+    const result = { daily, dayOfWeek };
+    await redis.setEx(cacheKey, 600, JSON.stringify(result));
+    res.status(200).json(result);
 
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
+// ─────────────────────────────────────────────────────────────
 // GET /reports/waste-analysis
+// ─────────────────────────────────────────────────────────────
 exports.getWasteAnalysis = async (req, res) => {
   try {
     const { branch_id, days = 30 } = req.query;
+    const cacheKey = `report:waste-analysis:${branch_id || 'all'}:${days}`;
+
+    const cached = await redis.get(cacheKey);
+    if (cached) return res.status(200).json(JSON.parse(cached));
+
     const endDate = new Date().toISOString().split('T')[0];
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
@@ -441,21 +491,31 @@ exports.getWasteAnalysis = async (req, res) => {
       };
     });
 
-    res.status(200).json({
+    const result = {
       data,
       avgWastePct: data.length ? (totalWastePct / data.length).toFixed(1) : 0,
       totalWasteCost,
-    });
+    };
+
+    await redis.setEx(cacheKey, 600, JSON.stringify(result));
+    res.status(200).json(result);
 
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
+// ─────────────────────────────────────────────────────────────
 // GET /reports/payment-mix
+// ─────────────────────────────────────────────────────────────
 exports.getPaymentMix = async (req, res) => {
   try {
     const { branch_id, days = 30 } = req.query;
+    const cacheKey = `report:payment-mix:${branch_id || 'all'}:${days}`;
+
+    const cached = await redis.get(cacheKey);
+    if (cached) return res.status(200).json(JSON.parse(cached));
+
     const endDate = new Date().toISOString().split('T')[0];
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
@@ -504,7 +564,7 @@ exports.getPaymentMix = async (req, res) => {
 
     const totalActualRevenue = totalCash + totalMpesa;
 
-    res.status(200).json({
+    const result = {
       data,
       totalCash,
       totalMpesa,
@@ -512,17 +572,27 @@ exports.getPaymentMix = async (req, res) => {
       totalExpectedRevenue,
       avgMpesaPct: data.length ? (totalMpesaPct / data.length).toFixed(1) : 0,
       revenueVariance: totalExpectedRevenue - totalActualRevenue,
-    });
+    };
+
+    await redis.setEx(cacheKey, 600, JSON.stringify(result));
+    res.status(200).json(result);
 
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
+// ─────────────────────────────────────────────────────────────
 // GET /reports/expense-breakdown
+// ─────────────────────────────────────────────────────────────
 exports.getExpenseBreakdown = async (req, res) => {
   try {
     const { branch_id, days = 30 } = req.query;
+    const cacheKey = `report:expense-breakdown:${branch_id || 'all'}:${days}`;
+
+    const cached = await redis.get(cacheKey);
+    if (cached) return res.status(200).json(JSON.parse(cached));
+
     const endDate = new Date().toISOString().split('T')[0];
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
@@ -555,7 +625,10 @@ exports.getExpenseBreakdown = async (req, res) => {
       pct: grandTotal > 0 ? ((parseFloat(row.total) / grandTotal) * 100).toFixed(1) : 0,
     }));
 
-    res.status(200).json({ data, grandTotal });
+    const result = { data, grandTotal };
+
+    await redis.setEx(cacheKey, 600, JSON.stringify(result));
+    res.status(200).json(result);
 
   } catch (error) {
     res.status(500).json({ message: error.message });
