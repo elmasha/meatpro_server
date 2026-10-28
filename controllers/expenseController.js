@@ -37,20 +37,26 @@ exports.createExpense = async (req, res) => {
 
     await connection.beginTransaction();
 
-    // ── HARD LOCK: check if the day has been closed ──
+    // ── SOFT LOCK: check if the day is closed, but allow if created today ──
     const [existingEntry] = await connection.execute(
-      `SELECT id FROM daily_entries 
+      `SELECT id, created_at FROM daily_entries 
         WHERE branch_id = ? AND date = ? 
         FOR UPDATE`,
       [branch_id, date]
     );
 
     if (existingEntry.length > 0) {
-      await connection.rollback();
-      return res.status(409).json({
-        message: `The day ${date} is already closed. Expenses cannot be added.`,
-        code: 'ENTRY_LOCKED'
-      });
+      const createdAt = new Date(existingEntry[0].created_at);
+      const today = new Date();
+      
+      // If the entry was NOT created today (i.e. it's an old entry), block it.
+      if (createdAt.toDateString() !== today.toDateString()) {
+        await connection.rollback();
+        return res.status(409).json({
+          message: `The day ${date} is already closed. Expenses cannot be added.`,
+          code: 'ENTRY_LOCKED'
+        });
+      }
     }
 
     const query = `INSERT INTO expenses (branch_id, title, amount, date) VALUES (?, ?, ?, ?)`;
