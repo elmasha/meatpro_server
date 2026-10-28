@@ -14,4 +14,7 @@ router.put('/expenses/:id', controller.updateExpense);
 // Delete an expense (e.g., /expenses/5)
 router.delete('/expenses/:id', controller.deleteExpense);
 
+router.get('/reports/last-7-days', controller.getLast7DaysReport);
+router.get('/reports/month-to-date', controller.getMonthToDateReport);
+
 module.exports = router;

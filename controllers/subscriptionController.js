@@ -1,4 +1,4 @@
-const db = require('../config/db');
+                                      const db = require('../config/db');
 const redis = require('../config/redis');
 const request = require('request');
 const moment = require('moment');

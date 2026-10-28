@@ -184,39 +184,42 @@ exports.getLast7DaysReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
 
-    // 1. Get Daily Entries (Your existing logic)
+    // Query calculates revenue from daily_entries
+    // AND calculates the true expenses from the expenses table
     const [rows] = await db.promise().query(`
       SELECT 
-        date,
-        SUM(actual_revenue) AS daily_actual_revenue,
-        SUM(cogs) AS daily_cogs
-      FROM daily_entries
-      WHERE branch_id = ? AND date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
-      GROUP BY date
+        d.date,
+        SUM(d.actual_revenue) AS totalActualRevenue,
+        SUM(d.revenue) AS totalRevenue,
+        SUM(d.cogs) AS totalCogs,
+        COALESCE((
+          SELECT SUM(amount) 
+          FROM expenses e 
+          WHERE e.date = d.date AND e.branch_id = d.branch_id
+        ), 0) AS daily_expenses
+      FROM daily_entries d
+      WHERE d.branch_id = ? AND d.date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+      GROUP BY d.date
     `, [branch_id]);
 
-    // 2. Calculate Totals
     let totalActualRevenue = 0;
+    let totalRevenue = 0;
     let totalCogs = 0;
+    let totalExpenses = 0;
+
     rows.forEach(row => {
-      totalActualRevenue += parseFloat(row.daily_actual_revenue) || 0;
-      totalCogs += parseFloat(row.daily_cogs) || 0;
+      totalActualRevenue += parseFloat(row.totalActualRevenue) || 0;
+      totalRevenue += parseFloat(row.totalRevenue) || 0;
+      totalCogs += parseFloat(row.totalCogs) || 0;
+      totalExpenses += parseFloat(row.daily_expenses) || 0;
     });
 
-    // 3. NEW: Get Total Expenses for the last 7 days
-    const [[expenseSum]] = await db.promise().query(`
-      SELECT COALESCE(SUM(amount), 0) AS total_expenses 
-      FROM expenses 
-      WHERE branch_id = ? AND date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
-    `, [branch_id]);
-
-    const totalExpenses = parseFloat(expenseSum.total_expenses) || 0;
-
-    // 4. Return the JSON with the totalCost (Expenses only)
+    // Return the calculated totalCost
     res.json({
-      totalActualRevenue: totalActualRevenue,
-      totalCogs: totalCogs,
-      totalCost: totalExpenses, // <-- Android will read this!
+      totalActualRevenue,
+      totalRevenue,
+      totalCogs,
+      totalCost: totalExpenses, // <--- This is what the app reads!
       data: rows
     });
 
@@ -224,8 +227,6 @@ exports.getLast7DaysReport = async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 };
-
-
 
 exports.getMonthToDateReport = async (req, res) => {
   try {
