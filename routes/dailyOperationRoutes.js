@@ -12,7 +12,7 @@ router.get('/daily-operations/last', dailyOps.getLastEntry);
 router.get('/daily-operations/:date', dailyOps.getEntryByDate);
 
 // ─────────────────────────────────────────────────────────────
-// EXPENSES
+// EXPENSES----
 // ─────────────────────────────────────────────────────────────
 router.post('/expenses', expenses.createExpense);
 router.get('/expenses/:date', expenses.getExpensesByDate);
