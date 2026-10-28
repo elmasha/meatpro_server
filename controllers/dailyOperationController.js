@@ -3,12 +3,14 @@ const redis = require('../config/redis');
 
 const fmt = (n) => { const v = parseFloat(n); return isNaN(v) ? 0 : Math.round(v * 100) / 100; };
 
+// ✅ FIX: Added the missing report cache keys so the dashboard updates instantly
 const invalidateDailyCache = async (branch_id, date) => {
   const keys = [
     `stock:current:${branch_id || 'all'}`,
     `report:last-entry:${branch_id || 'all'}`,
     `report:last-7-days:${branch_id || 'all'}`,
     `report:month-to-date:${branch_id || 'all'}`,
+    `report:comparative:${branch_id || 'all'}`,
     `daily:last:${branch_id || 'all'}`
   ];
   for (const key of keys) { await redis.del(key); }

@@ -91,7 +91,6 @@ exports.getExpensesByDate = async (req, res) => {
     let { branch_id } = req.query;
     const firebase_uid = req.firebase_uid;
 
-    // Auto-resolve branch_id from user profile if not provided
     if (!branch_id) {
       const [userRows] = await db.promise().execute(
         `SELECT branch_id FROM users WHERE firebase_uid = ? LIMIT 1`,
@@ -129,7 +128,6 @@ exports.getExpensesByDate = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // UPDATE EXPENSE — blocked if the day is already closed
-// (Optional — only if you have an edit-expense route)
 // ─────────────────────────────────────────────────────────────
 exports.updateExpense = async (req, res) => {
   const connection = await db.promise().getConnection();
@@ -151,7 +149,6 @@ exports.updateExpense = async (req, res) => {
 
     const { branch_id, date } = rows[0];
 
-    // Check if the day is closed
     const [closed] = await connection.execute(
       `SELECT id FROM daily_entries WHERE branch_id = ? AND date = ? LIMIT 1`,
       [branch_id, date]
@@ -186,13 +183,13 @@ exports.updateExpense = async (req, res) => {
   }
 };
 
-
+// ─────────────────────────────────────────────────────────────
+// LAST 7 DAYS REPORT
+// ─────────────────────────────────────────────────────────────
 exports.getLast7DaysReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
 
-    // Query calculates revenue from daily_entries
-    // AND calculates the true expenses from the expenses table
     const [rows] = await db.promise().query(`
       SELECT 
         d.date,
@@ -202,12 +199,12 @@ exports.getLast7DaysReport = async (req, res) => {
         COALESCE((
           SELECT SUM(amount) 
           FROM expenses e 
-          WHERE e.date = d.date AND e.branch_id = d.branch_id
+          WHERE e.date = d.date AND e.branch_id = ?
         ), 0) AS daily_expenses
       FROM daily_entries d
       WHERE d.branch_id = ? AND d.date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
       GROUP BY d.date
-    `, [branch_id]);
+    `, [branch_id, branch_id]);
 
     let totalActualRevenue = 0;
     let totalRevenue = 0;
@@ -221,13 +218,13 @@ exports.getLast7DaysReport = async (req, res) => {
       totalExpenses += parseFloat(row.daily_expenses) || 0;
     });
 
-    // Return the calculated totalCost
     res.json({
       totalActualRevenue,
       totalRevenue,
       totalCogs,
-      totalCost: totalExpenses, // <--- This is what the app reads!
-      data: rows
+      totalCost: totalExpenses,
+      totalExpenses: totalExpenses,
+      data: rows.map(r => ({ ...r, expenses: r.daily_expenses }))
     });
 
   } catch (error) {
@@ -235,44 +232,44 @@ exports.getLast7DaysReport = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────────────────────
+// MONTH TO DATE REPORT
+// ─────────────────────────────────────────────────────────────
 exports.getMonthToDateReport = async (req, res) => {
   try {
     const { branch_id } = req.query;
 
-    // 1. Get Daily Entries (Your existing logic)
     const [rows] = await db.promise().query(`
       SELECT 
         date,
         SUM(actual_revenue) AS daily_actual_revenue,
-        SUM(cogs) AS daily_cogs
+        SUM(cogs) AS daily_cogs,
+        COALESCE((
+          SELECT SUM(amount) 
+          FROM expenses e 
+          WHERE e.date = daily_entries.date AND e.branch_id = ?
+        ), 0) AS daily_expenses
       FROM daily_entries
       WHERE branch_id = ? AND date >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
       GROUP BY date
-    `, [branch_id]);
+    `, [branch_id, branch_id]);
 
-    // 2. Calculate Totals
     let totalActualRevenue = 0;
     let totalCogs = 0;
+    let totalExpenses = 0;
+
     rows.forEach(row => {
       totalActualRevenue += parseFloat(row.daily_actual_revenue) || 0;
       totalCogs += parseFloat(row.daily_cogs) || 0;
+      totalExpenses += parseFloat(row.daily_expenses) || 0;
     });
 
-    // 3. NEW: Get Total Expenses for the month
-    const [[expenseSum]] = await db.promise().query(`
-      SELECT COALESCE(SUM(amount), 0) AS total_expenses 
-      FROM expenses 
-      WHERE branch_id = ? AND date >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
-    `, [branch_id]);
-
-    const totalExpenses = parseFloat(expenseSum.total_expenses) || 0;
-
-    // 4. Return the JSON with the totalCost
     res.json({
       totalActualRevenue: totalActualRevenue,
       totalCogs: totalCogs,
-      totalCost: totalExpenses, // <-- Android will read this!
-      data: rows
+      totalCost: totalExpenses,
+      totalExpenses: totalExpenses,
+      data: rows.map(r => ({ ...r, expenses: r.daily_expenses }))
     });
 
   } catch (error) {
@@ -280,10 +277,8 @@ exports.getMonthToDateReport = async (req, res) => {
   }
 };
 
-
 // ─────────────────────────────────────────────────────────────
 // DELETE EXPENSE — blocked if the day is already closed
-// (Optional — only if you have a delete-expense route)
 // ─────────────────────────────────────────────────────────────
 exports.deleteExpense = async (req, res) => {
   const connection = await db.promise().getConnection();
